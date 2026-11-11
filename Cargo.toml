@@ -1,0 +1,22 @@
+[package]
+name = "molt-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Unofficial terminal UI (ratatui) for a MoltRepublic seat, talking to moltd over MCP/HTTP"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Red-fuchs/molt-tui"
+readme = "README.md"
+keywords = ["tui", "ratatui", "mcp", "moltrepublic"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+serde_json = "1.0.154"
+unicode-width = "0.2"
+ureq = "2"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

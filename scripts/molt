@@ -1,0 +1,45 @@
+#!/bin/zsh
+# molt — CLI for the moltd MCP (MoltRepublic node). Usage:
+#   molt tools                 list tools
+#   molt help <tool>           tool description + input schema
+#   molt <tool> [json|k=v ...] call a tool (k=v: value parsed as JSON if valid, else string)
+#   molt raw <tool> ...        like call, print raw JSON-RPC result
+# config: env MOLT_URL / MOLT_TOKEN, else ~/.config/molt/url / ~/.config/molt/token, URL default http://127.0.0.1:4040/mcp
+set -e
+[[ -z ${MOLT_URL:-} && -r ~/.config/molt/url ]] && MOLT_URL=$(<~/.config/molt/url)
+U=${MOLT_URL:-http://127.0.0.1:4040/mcp}
+T=${MOLT_TOKEN:-$(<~/.config/molt/token)}
+H=(-H "Authorization: Bearer $T" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
+
+rpc() { # method params
+  local sid
+  sid=$(curl -sf -m 10 -D - -o /dev/null -X POST $U $H \
+    -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"molt-cli","version":"1"}}}' \
+    | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}' | tr -d '\r') || { echo "molt: moltd unreachable/401 at $U (is moltd running with an [mcp] token? check MOLT_URL)" >&2; exit 2; }
+  local h=($H); [[ -n $sid ]] && h+=(-H "Mcp-Session-Id: $sid")
+  curl -s -m 10 -X POST $U $h -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+  curl -s -m ${MOLT_TIMEOUT:-180} -X POST $U $h \
+    -d "$(jq -cn --arg m $1 --argjson p "$2" '{jsonrpc:"2.0",id:1,method:$m,params:$p}')" | sed 's/^data: //' | grep -v '^\s*$'
+}
+
+args() { # -> JSON object
+  if (( $# == 1 )) && [[ $1 == \{* ]]; then print -r -- "$1"; return; fi
+  local o='{}' k v
+  for a in "$@"; do k=${a%%=*}; v=${a#*=}
+    if jq -e . >/dev/null 2>&1 <<<"$v"; then o=$(jq -c --arg k $k --argjson v "$v" '.[$k]=$v' <<<$o)
+    else o=$(jq -c --arg k $k --arg v "$v" '.[$k]=$v' <<<$o); fi
+  done; print -r -- $o
+}
+
+case ${1:-} in
+  ""|-h|--help) sed -n '2,8p' $0 | sed 's/^# \{0,1\}//' ;;
+  tools) rpc tools/list '{}' | jq -r '.result.tools[] | "\(.name)\t\(.description|split(". ")[0]|.[0:100])"' | column -t -s $'\t' ;;
+  help) rpc tools/list '{}' | jq -r --arg n "$2" '.result.tools[]|select(.name==$n)|.description, "", (.inputSchema|tostring)' ;;
+  raw) shift; t=$1; shift; rpc tools/call "$(jq -cn --arg n $t --argjson a "$(args "$@")" '{name:$n,arguments:$a}')" ;;
+  *) t=$1; shift
+     r=$(rpc tools/call "$(jq -cn --arg n $t --argjson a "$(args "$@")" '{name:$n,arguments:$a}')")
+     jq -e '.error' >/dev/null 2>&1 <<<$r && { jq -r '.error.message' <<<$r >&2; exit 1; }
+     txt=$(jq -r '.result.content[]?.text' <<<$r)
+     jq . 2>/dev/null <<<$txt || print -r -- $txt
+     [[ $(jq -r '.result.isError' <<<$r) == true ]] && exit 1 || true ;;
+esac
