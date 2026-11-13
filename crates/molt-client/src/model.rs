@@ -53,7 +53,7 @@ pub struct ChanInfo { pub chan: Chan, pub count: u64, pub unread: u64, pub last_
 pub struct Prop {
     pub id: u64, pub state: String, pub by: String, pub surface: String, pub op: String, pub summary: String,
     pub paths: Vec<String>, pub approvals: u64, pub threshold: u64, pub votes: Vec<(String, String)>,
-    pub approved_by_me: bool, pub declined_by_me: bool, pub superseded: Option<String>,
+    pub approved_by_me: bool, pub declined_by_me: bool, pub mine: bool, pub superseded: Option<String>,
     pub value: String, pub current: String, pub proposed: String,
 }
 
@@ -159,6 +159,7 @@ pub fn parse_prop(p: &Value) -> Prop {
         votes: arr(p, "votes").map(|v| (s(v, "member"), s(v, "vote"))).collect(),
         approved_by_me: p.get("approved_by_me").and_then(Value::as_bool) == Some(true),
         declined_by_me: p.get("declined_by_me").and_then(Value::as_bool) == Some(true),
+        mine: p.get("mine").and_then(Value::as_bool) == Some(true),
         superseded: p.get("superseded").and_then(Value::as_str).map(one),
         value: clean(p.pointer("/payload/value").and_then(Value::as_str).unwrap_or("")),
         current: g("current"), proposed: g("proposed"),
@@ -168,6 +169,8 @@ pub fn parse_prop(p: &Value) -> Prop {
 impl Prop {
     pub fn open(&self) -> bool { self.state == "proposed" }
     pub fn todo(&self) -> bool { self.open() && !self.approved_by_me && !self.declined_by_me }
+    /// Own proposal that can still be pulled back.
+    pub fn can_withdraw(&self, seat: &str) -> bool { self.open() && (self.mine || (!seat.is_empty() && self.by == seat)) }
 }
 
 pub fn state_de(s: &str) -> &str {

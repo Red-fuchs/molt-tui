@@ -354,7 +354,7 @@ fn draw_foot(f: &mut Frame, a: &App, r: Rect) {
         (View::Chat, Focus::Input) => "Enter senden · Alt+Enter Zeile · Tab Fokus · Ctrl+N Thema · F1 Hilfe",
         (View::Chat, Focus::Main) => "↑↓ Nachricht · r antworten · c kopieren · m gelesen · i schreiben · ? Hilfe",
         (View::Chat, Focus::Side) => "↑↓ Kanal · Enter öffnen · n neues Thema · m gelesen · ? Hilfe",
-        (View::Props, _) => "↑↓ wählen/scrollen · a zustimmen · d ablehnen · t Diskussion · Tab Fokus · ? Hilfe",
+        (View::Props, _) => "↑↓ wählen · a zustimmen · d ablehnen · n neu · w zurückziehen · t Diskussion · ? Hilfe",
         (View::Wiki, _) => "↑↓ Dokument/scrollen · Enter lesen · Tab Fokus · ? Hilfe",
     };
     let m = format!(" Maus {}(F2) ", if a.mouse { "an " } else { "aus " });
@@ -386,6 +386,14 @@ fn draw_modal(f: &mut Frame, a: &App, m: &Modal) {
                 Line::default(),
                 Line::from(sp(format!("J = ja, {} · N/Esc = abbrechen", verb.to_lowercase()), BOLD))], Color::Red)
         }
+        Modal::Withdraw(id) => {
+            let s = a.snap.props.iter().find(|p| p.id == *id).map(|p| format!("{} {}", p.op, p.summary)).unwrap_or_default();
+            (format!(" Vorschlag #{id} zurückziehen "), vec![
+                Line::from(sp(format!("Eigenen Vorschlag #{id} wirklich zurückziehen?"), BOLD.fg(Color::Yellow))), Line::from(sp(s, DIM)), Line::default(),
+                Line::from("Er wird für alle Mitglieder beendet und lässt sich nicht wieder öffnen."), Line::default(),
+                Line::from(sp("J = ja, zurückziehen · N/Esc = abbrechen", BOLD))], Color::Red)
+        }
+        Modal::Propose(p) => { draw_propose(f, p); return }
         Modal::NewTopic(t) => (" Neues Thema ".into(), vec![
             Line::from("Name des Themas (max. 64 Zeichen); es entsteht mit der ersten Nachricht:"), Line::default(),
             Line::from(vec![sp(format!("> {t}"), Style::new()), sp("▏", Style::new().fg(Color::Cyan))]), Line::default(),
@@ -397,13 +405,53 @@ fn draw_modal(f: &mut Frame, a: &App, m: &Modal) {
     f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }).block(b), area);
 }
 
+fn draw_propose(f: &mut Frame, p: &PropForm) {
+    let cur = |on: bool| if on { sp("▏", Style::new().fg(Color::Cyan)) } else { sp("", Style::new()) };
+    let lbl = |on: bool, s: &str| Line::from(sp(s.to_string(), if on { BOLD.fg(Color::Cyan) } else { DIM }));
+    let mut body: Vec<Line> = vec![];
+    let title = if let Some(pl) = &p.plan {
+        body.push(Line::from(sp("Vorschau: genau das wird gesendet", BOLD.fg(Color::Yellow))));
+        body.push(Line::default());
+        let pv: Vec<&str> = pl.preview.lines().collect();
+        for l in pv.iter().take(12) { body.push(Line::from(trunc(l, 84))) }
+        if pv.len() > 12 { body.push(Line::from(sp(format!("… (+{} Zeilen)", pv.len() - 12), DIM))) }
+        body.push(Line::default());
+        body.push(Line::from("Vorschlag einreichen = signierte Aktion: echte Signatur, nicht rückgängig zu machen."));
+        body.push(Line::from(sp("J = verbindlich einreichen · Esc zurück zum Formular · N abbrechen", BOLD)));
+        " Vorschlag prüfen · ECHTE SIGNATUR "
+    } else {
+        let k = p.kind();
+        let (la, lb) = k.fields();
+        body.push(lbl(p.field == 0, "Typ (← → wählen)"));
+        body.push(Line::from(vec![sp(format!("◀ {} ▶", k.label()), if p.field == 0 { BOLD } else { Style::new() }), sp(if k.advanced() { "  ERWEITERT: wirkt auf die ganze Republik" } else { "" }, Style::new().fg(Color::Yellow))]));
+        if !la.is_empty() { body.push(lbl(p.field == 1, la)); body.push(Line::from(vec![sp(format!("> {}", p.a), Style::new()), cur(p.field == 1)])) }
+        if !lb.is_empty() {
+            body.push(lbl(p.field == 2, &format!("{lb} (Enter = neue Zeile)")));
+            let mut s: Vec<char> = p.b.t.clone();
+            s.insert(p.b.cur.min(s.len()), '▏');
+            let txt: String = s.into_iter().collect();
+            let ls: Vec<&str> = txt.split('\n').collect();
+            let first = ls.iter().position(|l| l.contains('▏')).unwrap_or(0).saturating_sub(7);
+            for l in ls.iter().skip(first).take(8) { body.push(Line::from(trunc(l, 84))) }
+        }
+        if !p.err.is_empty() { body.push(Line::default()); body.push(Line::from(sp(p.err.clone(), Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)))) }
+        body.push(Line::default());
+        body.push(Line::from(sp("Tab Feld · Ctrl+S Vorschau (noch nichts gesendet) · Esc abbrechen", BOLD)));
+        " Vorschlag erstellen "
+    };
+    let area = centered(f.area(), 90, (body.len() as u16 + 2).min(f.area().height));
+    f.render_widget(Clear, area);
+    let b = Block::bordered().title(title).border_style(Style::new().fg(if p.plan.is_some() { Color::Red } else { Color::Cyan }).add_modifier(Modifier::BOLD));
+    f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }).block(b), area);
+}
+
 fn draw_help(f: &mut Frame) {
     let k = |a: &str, b: &str| Line::from(vec![sp(format!(" {a:<22}"), BOLD.fg(Color::Cyan)), sp(b.to_string(), Style::new())]);
     let h = |t: &str| Line::from(sp(format!(" {t}"), BOLD.fg(Color::Yellow)));
     let lines = vec![
         h("Allgemein"),
         k("F1 / ?", "Hilfe"), k("F3 F4 F5 / 1 2 3", "Chat · Vorschläge · Wiki (Tabs auch klickbar)"),
-        k("Tab / Shift+Tab", "Fokus: Kanäle → Nachrichten → Eingabe"), k("Ctrl+N", "neues Thema"),
+        k("Tab / Shift+Tab", "Fokus: Kanäle → Nachrichten → Eingabe"), k("Ctrl+N / Ctrl+P", "neues Thema / neuer Vorschlag"),
         k("Ctrl+R", "jetzt aktualisieren"), k("F6", "Rückfrage vor dem Senden an/aus"),
         k("Ctrl+C / q", "beenden (q nur wenn du nicht tippst)"),
         h("Maus"),
@@ -423,6 +471,7 @@ fn draw_help(f: &mut Frame) {
         h("Vorschläge"),
         k("↑ ↓", "Vorschlag wählen (links) / Diff scrollen (rechts)"), k("a / d", "zustimmen / ablehnen: echte Signatur, nur nach J"),
         k("t", "Diskussion des Vorschlags öffnen"),
+        k("n / Ctrl+P", "Vorschlag erstellen (Vorschau, dann J = signieren)"), k("w", "eigenen offenen Vorschlag zurückziehen (J)"),
         Line::default(), Line::from(sp(" Esc / F1 schließt", DIM)),
     ];
     let area = centered(f.area(), 92, lines.len() as u16 + 2);
@@ -514,5 +563,18 @@ mod t {
         let mut a = app();
         let s = dump(&mut a, 100, 12);
         assert!(s.contains("noch weiter geht"), "{s}");
+    }
+    #[test]
+    fn propose_modal_frames() {
+        use molt_client::compose;
+        let mut a = app();
+        a.modal = Some(Modal::Propose(Box::new(PropForm::new())));
+        let d = dump(&mut a, 110, 36);
+        assert!(d.contains("Vorschlag erstellen") && d.contains("Wiki: neue Seite") && d.contains("Ctrl+S"), "{d}");
+        if let Some(Modal::Propose(f)) = &mut a.modal { f.a = "x/y.md".into(); f.b.insert_str("# Titel"); f.plan = compose::plan(f.kind(), &f.a, &f.b.text()).ok() }
+        let d = dump(&mut a, 110, 36);
+        assert!(d.contains("ECHTE SIGNATUR") && d.contains("x/y.md") && d.contains("J = verbindlich"), "{d}");
+        a.modal = Some(Modal::Withdraw(4));
+        assert!(dump(&mut a, 110, 36).contains("zurückziehen"));
     }
 }

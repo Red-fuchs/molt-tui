@@ -1,3 +1,4 @@
+pub mod compose;
 pub mod mcp;
 #[cfg(any(feature = "mock", test))]
 pub mod mock;

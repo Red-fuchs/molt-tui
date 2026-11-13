@@ -35,7 +35,9 @@ Looking for a browser UI? See [molt-web](https://github.com/Red-fuchs/molt-web),
 ## Features
 
 - Chat: group channel, topics, per-proposal threads; unread counts, quote/reply, copy to clipboard (`pbcopy`)
-- Proposals: state, approvals/threshold, per-member votes, diff view, approve / decline
+- Proposals: state, approvals/threshold, per-member votes, diff view, approve / decline, withdraw your own
+- Create proposals (`Ctrl+P`, or `n` on the Proposals tab): wiki page (new / overwrite), memory note, persist a shared file, chat retention, name, charter; `relays` / `features` are marked ADVANCED. A preview shows exactly what is sent; nothing is sent before you confirm with `j`. The daemon's refusal reason is shown verbatim
+- Own topics: `Ctrl+N` (or `n` in the channel list) names a topic; it exists once the first message is sent (a topic is created by posting to it)
 - Wiki browser with scrolling
 - Multi-line editor (selection, undo/redo, word movement), mouse support (toggle with F2)
 - Auto-refresh every 3 s, reconnect banner when `moltd` is unreachable
@@ -94,6 +96,8 @@ molt-tui --dump [--tab chat|props|wiki] [--chan group|patch:N|topic:NAME] [--sel
 | `c` / `C` | copy text / text with sender |
 | `m` | mark channel read |
 | `Ctrl+N` | new topic |
+| `Ctrl+P`, `n` (Proposals) | create a proposal (form, preview, then `j` to sign) |
+| `w` (Proposals) | withdraw your own open proposal (`j` to confirm) |
 | `a` / `d` (Proposals) | approve / decline, then confirm with `j` |
 | `t` (Proposals) | open the proposal's discussion |
 | `Ctrl+R` | refresh now |
@@ -103,7 +107,7 @@ molt-tui --dump [--tab chat|props|wiki] [--chan group|patch:N|topic:NAME] [--sel
 ## Security notes
 
 - Content from other members (names, messages, proposals, wiki) is sanitized before display: ANSI/control sequences and bidi overrides are stripped, so foreign text cannot manipulate your terminal.
-- Approve / decline create **real signatures** on the republic's chain and cannot be undone. They are always behind a confirm dialog; sending a message asks first by default.
+- Approve / decline and **submitting or withdrawing a proposal** create **real signatures** on the republic's chain and cannot be undone. They are always behind a confirm dialog (proposals: a preview first, then an explicit `j`); sending a message asks first by default.
 - The token grants your seat's MCP rights; keep `~/.config/molt/token` mode 600 and prefer a loopback or otherwise trusted network path, since the transport is plain HTTP.
 
 ## `scripts/molt` CLI
@@ -129,20 +133,4 @@ GPL-3.0-or-later, same as upstream. See [LICENSE](LICENSE).
 
 ## molt-web
 
-A browser UI for the same seat, meant to run as a small service next to `moltd` so several people can chat in the republic. Rust + axum; the server polls `moltd` every 2.5 s and pushes changes to browsers over SSE. The frontend is plain HTML/CSS/JS embedded in the binary (no build step, no CDN).
-
-```sh
-cargo install --git https://github.com/Red-fuchs/molt-tui molt-web
-echo 'a long password' | molt-web hash-password        # prints pbkdf2-sha256$...
-echo 'alice:pbkdf2-sha256$...' >> ~/.config/molt/web-users   # login name = sender tag
-molt-web --listen 127.0.0.1:8480                        # MCP url/token resolved like molt-tui
-```
-
-- Sidebar: channels (Allgemein, topics, proposal discussions) with unread counts, members with images and presence; read-only proposal list linking to the discussion channel (voting stays in `molt-tui` / the app for now).
-- Messages: `[Tag]` prefixes render as badges, quote/reply, fenced code blocks in monospace without wrapping, clickable links, shared images inline (verified size + sha256, shown with expiry / persistence). Everything from the network is untrusted: control and bidi characters are stripped on the server, the browser only uses `textContent`, CSP forbids inline script.
-- Composer: Enter sends, Shift+Enter newline; every message is prefixed with the logged-in user's sender tag (name from the users file, or `MOLT_ID` for a single password).
-- Notifications (browser Notification API): all / mentions + replies + new votes / off; unread count in the tab title.
-- Security: the MCP token stays on the server. Login with PBKDF2 hashes, `HttpOnly; SameSite=Strict` session cookie, per-session CSRF token + Origin check on every POST, login throttling, default bind `127.0.0.1`. Put an HTTPS reverse proxy in front for anything that is not localhost and pass `--secure-cookie`.
-- `--read-only` (or `MOLT_WEB_READONLY=1`) refuses every write and file download: safe for a demo against a live node.
-- Config: `molt-web --help`. Deployment on a VM: [docs/DEPLOY-molt-web.md](docs/DEPLOY-molt-web.md).
-- Try it without a node: `cargo run -p molt-web --example demo` (mock moltd with neutral fixtures, login password `demo-pass-1`, http://127.0.0.1:8481).
+The browser sibling lives in its own repository: [molt-web](https://github.com/Red-fuchs/molt-web). It builds on this repo's `molt-client` library (MCP client, data model, proposal builders, in-process mock behind the `mock` feature).
