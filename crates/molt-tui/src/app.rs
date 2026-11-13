@@ -45,6 +45,8 @@ fn pbpaste() -> String {
     Command::new("pbpaste").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
 }
 
+pub use molt_client::model::{sender_id, tag_body};
+
 impl App {
     pub fn new(off: i64) -> App {
         App {
@@ -154,7 +156,7 @@ impl App {
         if self.confirm { self.modal = Some(Modal::Send) } else { self.do_send() }
     }
     fn do_send(&mut self) {
-        let mut a = json!({"body": self.ed.text().trim_end()});
+        let mut a = json!({"body": tag_body(self.ed.text().trim_end(), &sender_id())});
         if let Some(c) = self.cur.to_json() { a["channel"] = c }
         if let Some(q) = &self.quote { a["quote"] = json!(q) }
         self.sending = true;
@@ -458,6 +460,12 @@ mod t {
         (a, rx)
     }
     #[test]
+    fn sender_tag() {
+        assert_eq!(tag_body("hi", "Redfuchs"), "[Redfuchs] hi");
+        assert_eq!(tag_body("[Redfuchs] hi", "Redfuchs"), "[Redfuchs] hi");
+        assert_eq!(tag_body("hi", "-"), "hi");
+    }
+    #[test]
     fn send_flow_with_confirm() {
         let (mut a, rx) = app();
         a.select_chan(Chan::Topic("Ideen".into()));
@@ -468,7 +476,8 @@ mod t {
         a.on_key(key(KeyCode::Enter));
         let r = rx.try_recv().unwrap();
         assert_eq!(r.name, "chat_send");
-        assert_eq!(r.args["body"], "hi");
+        assert!(r.args["body"].as_str().unwrap().starts_with('['), "sender tag missing");
+        assert!(r.args["body"].as_str().unwrap().ends_with("] hi"));
         assert_eq!(r.args["channel"]["name"], "Ideen");
         assert!(a.sending);
         assert_eq!(a.ed.text(), "hi");

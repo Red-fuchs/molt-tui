@@ -450,14 +450,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "molt-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "molt-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "molt-client",
  "ratatui",
  "serde_json",
  "unicode-width 0.2.0",
- "ureq",
 ]
 
 [[package]]

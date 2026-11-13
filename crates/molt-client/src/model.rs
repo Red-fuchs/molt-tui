@@ -29,6 +29,21 @@ impl Chan {
 pub struct Msg {
     pub id: String, pub from: String, pub ts: i64, pub body: String, pub chan: Chan,
     pub quote: Option<String>, pub reactions: Vec<(String, usize)>,
+    pub kind: String, pub file: Option<FileMeta>,
+}
+
+/// File share attached to a chat message (the key material the daemon sends is deliberately dropped).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileMeta { pub name: String, pub kind: String, pub size: u64, pub checksum: String }
+
+#[derive(Clone, Debug, Default)]
+pub struct Member { pub name: String, pub desc: String, pub image: String, pub presence: u64, pub last_seen: i64, pub uploads: u64 }
+
+#[derive(Clone, Debug, Default)]
+pub struct Upload {
+    pub id: String, pub name: String, pub kind: String, pub member: String, pub size: u64, pub ts: i64,
+    pub expires_ts: i64, pub persistent: bool, pub availability: String, pub local: String,
+    pub online: bool, pub available: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +99,9 @@ pub fn parse_chat(v: &Value) -> (Vec<Msg>, Vec<ChanInfo>, u64) {
         quote: m.get("quote").or(m.get("quoted")).and_then(Value::as_str).map(str::to_string),
         reactions: m.get("reactions").and_then(Value::as_object).into_iter().flatten()
             .map(|(k, v)| (one(k), v.as_array().map_or(0, Vec::len))).collect(),
+        kind: s(m, "kind"),
+        file: m.get("file").filter(|f| f.is_object()).map(|f| FileMeta {
+            name: s(f, "name"), kind: s(f, "kind"), size: u(f, "size"), checksum: s(f, "checksum").to_lowercase() }),
     }).collect();
     let chans = arr(v, "channels").map(|c| ChanInfo {
         chan: c.get("channel").map(Chan::from_json).unwrap_or(Chan::Group),
@@ -91,6 +109,43 @@ pub fn parse_chat(v: &Value) -> (Vec<Msg>, Vec<ChanInfo>, u64) {
         state: c.get("state").and_then(Value::as_str).map(one),
     }).collect();
     (msgs, chans, u(v, "wiki_rev"))
+}
+
+pub fn parse_members(v: &Value) -> Vec<Member> {
+    arr(v, "members").map(|m| Member {
+        name: s(m, "member"), desc: one(m.get("description").and_then(Value::as_str).unwrap_or("")),
+        image: m.get("image").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+        presence: u(m, "presence"), last_seen: m.get("last_seen").and_then(Value::as_i64).unwrap_or(0), uploads: u(m, "uploads"),
+    }).collect()
+}
+
+pub fn parse_uploads(v: &Value) -> Vec<Upload> {
+    let b = |m: &Value, k: &str| m.get(k).and_then(Value::as_bool) == Some(true);
+    arr(v, "uploads").map(|m| Upload {
+        id: s(m, "id"), name: s(m, "name"), kind: s(m, "kind"), member: s(m, "member"), size: u(m, "size"),
+        ts: m.get("ts").and_then(Value::as_i64).unwrap_or(0), expires_ts: m.get("expires_ts").and_then(Value::as_i64).unwrap_or(0),
+        persistent: b(m, "persistent"), availability: s(m, "availability"), local: s(m, "local"),
+        online: b(m, "online"), available: b(m, "available"),
+    }).collect()
+}
+
+/// Sender tag so humans and the AIs sharing one seat stay distinguishable. env MOLT_ID ("-" = off), default Redfuchs.
+pub fn sender_id() -> String { std::env::var("MOLT_ID").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "Redfuchs".into()) }
+pub fn tag_body(b: &str, id: &str) -> String {
+    let t = format!("[{id}] ");
+    if id == "-" || b.starts_with(&t) { b.into() } else { t + b }
+}
+/// Split a leading `[Tag] ` (1..=32 chars, no brackets/newlines) off a message body.
+pub fn split_tag(b: &str) -> (Option<&str>, &str) {
+    if let Some(r) = b.strip_prefix('[') {
+        if let Some(i) = r.find(']') {
+            let t = &r[..i];
+            if (1..=32).contains(&t.chars().count()) && !t.contains(['[', '\n']) {
+                if let Some(rest) = r[i + 1..].strip_prefix(' ') { return (Some(t), rest) }
+            }
+        }
+    }
+    (None, b)
 }
 
 pub fn parse_prop(p: &Value) -> Prop {
@@ -185,7 +240,6 @@ pub fn props_sorted(ps: &[Prop]) -> Vec<&Prop> {
     v
 }
 
-#[cfg(test)]
 pub mod fixtures {
     use super::*;
     pub fn snap() -> Snap {
@@ -230,6 +284,26 @@ mod t {
         let l: Vec<_> = e.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(l, vec!["Allgemein", "Neu (neu)", "Ideen", "#4 (offen) wiki_patch +1 ~163", "#1 (angenommen) wiki_patch +3"]);
         assert_eq!(e[0].unread, 2);
+    }
+    #[test]
+    fn tags() {
+        assert_eq!(tag_body("hi", "Redfuchs"), "[Redfuchs] hi");
+        assert_eq!(tag_body("[Redfuchs] hi", "Redfuchs"), "[Redfuchs] hi");
+        assert_eq!(tag_body("hi", "-"), "hi");
+        assert_eq!(split_tag("[Claude] hi there"), (Some("Claude"), "hi there"));
+        assert_eq!(split_tag("[] x"), (None, "[] x"));
+        assert_eq!(split_tag("[a\nb] x"), (None, "[a\nb] x"));
+        assert_eq!(split_tag("no tag [x] y"), (None, "no tag [x] y"));
+    }
+    #[test]
+    fn members_uploads_files() {
+        let m = parse_members(&json!({"members":[{"member":"bob","image":"/x/y.png","presence":0,"last_seen":5,"uploads":2,"description":"hi\nyo"}]}));
+        assert_eq!((m[0].name.as_str(), m[0].image.as_str(), m[0].desc.as_str()), ("bob", "/x/y.png", "hi ⏎ yo"));
+        let u = parse_uploads(&json!({"uploads":[{"id":"ab","name":"p.png","kind":"Image","size":3,"persistent":true,"expires_ts":0,"local":"own","online":true,"available":true}]}));
+        assert!(u[0].persistent && u[0].online && u[0].local == "own");
+        let c = parse_chat(&json!({"applied":[{"id":"1","from":"a","ts":1,"body":"x","kind":"user","file":{"name":"p.png","kind":"Image","size":3,"checksum":"AB","key_b64":"SECRET"}}]}));
+        assert_eq!(c.0[0].file.as_ref().unwrap().checksum, "ab");
+        assert!(!format!("{:?}", c.0).contains("SECRET"));
     }
     #[test]
     fn chan_json() {

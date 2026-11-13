@@ -1,0 +1,15 @@
+[package]
+name = "molt-client"
+version.workspace = true
+edition.workspace = true
+description = "MCP-over-HTTP client and data model for a MoltRepublic seat (moltd)"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json = "1.0.154"
+ureq = "2"
+
+[features]
+# in-process MCP mock for tests of dependent crates (dev-dependency only)
+mock = []

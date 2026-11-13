@@ -12,15 +12,11 @@ pub struct Mcp {
 /// Parse a JSON-RPC reply that is either plain JSON or SSE-framed (`data:` lines).
 pub fn parse_sse(body: &str) -> Option<Value> {
     let b = body.trim();
-    if b.starts_with('{') {
-        if let Ok(v) = serde_json::from_str(b) { return Some(v) }
-    }
+    if b.starts_with('{') && let Ok(v) = serde_json::from_str(b) { return Some(v) }
     let mut best: Option<Value> = None;
     let mut data = String::new();
     let flush = |data: &mut String, best: &mut Option<Value>| {
-        if let Ok(v) = serde_json::from_str::<Value>(data.trim()) {
-            if v.get("result").is_some() || v.get("error").is_some() || best.is_none() { *best = Some(v) }
-        }
+        if let Ok(v) = serde_json::from_str::<Value>(data.trim()) && (v.get("result").is_some() || v.get("error").is_some() || best.is_none()) { *best = Some(v) }
         data.clear();
     };
     for l in body.lines() {
@@ -53,22 +49,49 @@ fn emsg(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(401, _) => "HTTP 401 (Token abgelehnt)".into(),
         ureq::Error::Status(c, _) => format!("HTTP {c}"),
-        ureq::Error::Transport(t) => t.message().map(str::to_string).unwrap_or_else(|| t.kind().to_string()),
+        ureq::Error::Transport(t) => format!("transport: {}", t.message().map_or_else(|| t.kind().to_string(), str::to_string)),
     }
 }
 
+impl std::fmt::Debug for Mcp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mcp").field("url", &self.url).field("tok", &"<redacted>").finish_non_exhaustive()
+    }
+}
+
+/// Tools that only read (or are idempotent): safe to repeat after an ambiguous failure.
+pub fn is_read_only(name: &str) -> bool {
+    name.starts_with("read_") || name.starts_with("list_") || matches!(name, "status" | "download_file" | "mark_channel_read" | "quests_view" | "wiki_get" | "wiki_list" | "wiki_search" | "wiki_links" | "wiki_neighbors" | "wiki_props" | "wiki_health" | "wiki_changes")
+}
+
+/// Retry with a fresh session? Always when the daemon says the session is gone (request was not processed);
+/// after any other failure (timeout, 5xx, unreadable reply) only for read-only tools: a write may already have happened.
+pub fn should_retry(name: &str, err: &str) -> bool {
+    let l = err.to_lowercase();
+    let expired = err.starts_with("HTTP 404") || err.starts_with("HTTP 400") || l.contains("session");
+    expired || (is_read_only(name) && (err.starts_with("HTTP") || err.starts_with("transport:") || err.contains("Antwort")))
+}
+
 impl Mcp {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> { Self::resolve(None, None) }
+
+    /// Explicit values win, then env MOLT_URL / MOLT_TOKEN, then ~/.config/molt/{url,token}, then the default URL.
+    pub fn resolve(url: Option<String>, tok: Option<String>) -> Result<Self, String> {
         let home = std::env::var("HOME").unwrap_or_default();
         let rd = |env: &str, f: &str| std::env::var(env).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
             .or_else(|| std::fs::read_to_string(format!("{home}/.config/molt/{f}")).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()));
-        let url = rd("MOLT_URL", "url").unwrap_or_else(|| "http://127.0.0.1:4040/mcp".into());
-        let tok = rd("MOLT_TOKEN", "token").ok_or_else(|| "Token fehlt: MOLT_TOKEN oder ~/.config/molt/token (oder --token-file)".to_string())?;
+        let url = url.filter(|v| !v.is_empty()).or_else(|| rd("MOLT_URL", "url")).unwrap_or_else(|| "http://127.0.0.1:4040/mcp".into());
+        let tok = tok.map(|t| t.trim().to_string()).filter(|v| !v.is_empty()).or_else(|| rd("MOLT_TOKEN", "token"))
+            .ok_or_else(|| "Token fehlt: MOLT_TOKEN oder ~/.config/molt/token (oder --token-file)".to_string())?;
+        Ok(Self::with(url, tok))
+    }
+
+    pub fn with(url: String, tok: String) -> Self {
         let ag = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(3))
             .timeout(Duration::from_secs(20))
             .build();
-        Ok(Mcp { url, tok: tok.trim().to_string(), ag, sid: Mutex::new(None) })
+        Mcp { url, tok, ag, sid: Mutex::new(None) }
     }
 
     fn post(&self, body: &Value, sid: Option<&str>) -> Result<(Option<String>, String), String> {
@@ -85,7 +108,7 @@ impl Mcp {
 
     fn init(&self) -> Result<Option<String>, String> {
         let (sid, _) = self.post(&json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
-            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"molt-tui","version":"1"}}}), None)?;
+            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"molt-client","version":"1"}}}), None)?;
         self.post(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), sid.as_deref())?;
         Ok(sid)
     }
@@ -105,7 +128,7 @@ impl Mcp {
 
     pub fn call(&self, name: &str, args: Value) -> Result<Value, String> {
         match self.once(name, &args, false) {
-            Err(e) if e.starts_with("HTTP") || e.contains("Antwort") || e.to_lowercase().contains("session") => {
+            Err(e) if should_retry(name, &e) => {
                 *self.sid.lock().unwrap() = None;
                 self.once(name, &args, true)
             }
@@ -130,6 +153,21 @@ mod t {
         assert_eq!(tool_result(&v).unwrap(), Value::String("hi".into()));
         assert!(parse_sse("{\"result\":{\"content\":[]}}").is_some());
         assert!(parse_sse("garbage").is_none());
+    }
+    #[test]
+    fn retry_rules() {
+        assert!(should_retry("chat_send", "HTTP 404"));
+        assert!(should_retry("chat_send", "Session expired"));
+        assert!(!should_retry("chat_send", "HTTP 502"));
+        assert!(!should_retry("share_file", "transport: timed out"));
+        assert!(!should_retry("chat_send", "Antwort nicht lesbar"));
+        assert!(should_retry("read_state", "HTTP 502") && should_retry("status", "transport: reset"));
+        assert!(!should_retry("read_state", "Token falsch"));
+    }
+    #[test]
+    fn debug_hides_token() {
+        let m = Mcp::with("http://x/mcp".into(), "SECRET".into());
+        assert!(!format!("{m:?}").contains("SECRET"));
     }
     #[test]
     fn errors() {
