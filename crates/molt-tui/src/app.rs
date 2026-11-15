@@ -100,6 +100,7 @@ impl App {
         self.extra.retain(|n| !have.contains(&&Chan::Topic(n.clone())));
         self.entries = group_channels(&self.snap.chans, &self.snap.props, &self.extra);
         if !self.entries.iter().any(|e| e.chan == self.cur) { self.cur = Chan::Group }
+        if let Some(s) = self.hdr { if !self.entries.iter().any(|e| (e.section as usize).min(3) == s) || s == 0 { self.hdr = None } }
         self.psel = self.psel.min(self.snap.props.len().saturating_sub(1));
         self.wsel = self.wsel.min(self.snap.docs.len().saturating_sub(1));
     }
@@ -270,18 +271,19 @@ impl App {
         self.reveal = true;
     }
     pub fn is_col(&self, sec: usize) -> bool { self.col.contains(crate::uistate::SECS[sec.min(3)].0) }
-    /// Visible sidebar rows: a header per section; collapsed sections keep only the selected and unread channels.
+    /// Visible sidebar rows: a header per section; section 0 (Allgemein) has no header; collapsed sections keep only the selected channel.
     pub fn side_rows(&self) -> Vec<Row> {
         let mut v = vec![];
         let mut last = usize::MAX;
         for (i, e) in self.entries.iter().enumerate() {
             let sec = (e.section as usize).min(3);
-            if sec != last { v.push(Row::Head(sec)); last = sec }
-            if !self.is_col(sec) || e.chan == self.cur || e.unread > 0 { v.push(Row::Ent(i)) }
+            if sec != last { if sec != 0 { v.push(Row::Head(sec)) } last = sec }
+            if sec == 0 || !self.is_col(sec) || e.chan == self.cur { v.push(Row::Ent(i)) }
         }
         v
     }
-    pub fn sec_unread(&self, sec: usize) -> u64 { self.entries.iter().filter(|e| (e.section as usize).min(3) == sec).map(|e| e.unread).sum() }
+    /// Unread of the entries hidden by collapsing (selected one stays visible, not counted).
+    pub fn sec_unread(&self, sec: usize) -> u64 { self.entries.iter().filter(|e| (e.section as usize).min(3) == sec && e.chan != self.cur).map(|e| e.unread).sum() }
     pub fn save_ui(&self) { if let Some(p) = &self.ui_path { let _ = crate::uistate::save(p, &self.col, self.sidebar); } }
     pub fn load_ui(&mut self, p: std::path::PathBuf) { (self.col, self.sidebar) = crate::uistate::load(&p); self.ui_path = Some(p); }
     pub fn toggle_sec(&mut self, sec: usize) {
@@ -290,7 +292,7 @@ impl App {
         self.save_ui();
     }
     pub fn toggle_all(&mut self) {
-        let present: Vec<usize> = { let mut v: Vec<usize> = self.entries.iter().map(|e| (e.section as usize).min(3)).collect(); v.dedup(); v };
+        let present: Vec<usize> = { let mut v: Vec<usize> = self.entries.iter().map(|e| (e.section as usize).min(3)).filter(|s| *s != 0).collect(); v.dedup(); v };
         if present.iter().all(|s| self.is_col(*s)) { self.col.clear() } else { for s in present { self.col.insert(crate::uistate::SECS[s].0.to_string()); } }
         self.save_ui();
     }
@@ -303,6 +305,7 @@ impl App {
     fn side_move(&mut self, d: i32) {
         let rows = self.side_rows();
         if rows.is_empty() { return }
+        if let Some(s) = self.hdr { if !rows.contains(&Row::Head(s)) { self.hdr = None } }
         let cur = match self.hdr { Some(s) => rows.iter().position(|r| *r == Row::Head(s)), None => rows.iter().position(|r| matches!(r, Row::Ent(i) if self.entries[*i].chan == self.cur)) }.unwrap_or(0) as i32;
         let n = (cur + d).clamp(0, rows.len() as i32 - 1) as usize;
         match rows[n] {
@@ -774,16 +777,18 @@ mod t {
     fn collapse_keeps_selected_and_unread() {
         let mut a = side_app();
         a.cur = Chan::Topic("A".into());
-        assert_eq!(a.side_rows().len(), 8);
+        assert_eq!(a.side_rows().len(), 7);
         a.toggle_sec(1);
         let r = a.side_rows();
         let ents: Vec<usize> = r.iter().filter_map(|x| if let Row::Ent(i) = x { Some(*i) } else { None }).collect();
-        assert_eq!(ents, vec![0, 1, 2, 4]); // A (selected) + B (unread) stay, C hidden
+        assert_eq!(ents, vec![0, 1, 4]); // only selected A stays
         assert_eq!(a.sec_unread(1), 3);
+        a.cur = Chan::Topic("B".into());
+        assert_eq!(a.sec_unread(1), 0); // selected B not hidden
         a.toggle_sec(1);
-        assert_eq!(a.side_rows().len(), 8);
+        assert_eq!(a.side_rows().len(), 7);
         a.toggle_all();
-        assert!(a.is_col(0) && a.is_col(1) && a.is_col(2));
+        assert!(!a.is_col(0) && a.is_col(1) && a.is_col(2));
         a.toggle_all();
         assert!(a.col.is_empty());
     }
@@ -792,15 +797,44 @@ mod t {
     fn header_keyboard_and_mouse_toggle() {
         let mut a = side_app();
         a.focus = Focus::Side;
-        a.on_key(key(KeyCode::Up)); // Allgemein entry -> its header
-        assert_eq!(a.hdr, Some(0));
+        a.on_key(key(KeyCode::Down)); // Allgemein -> header Themen
+        assert_eq!(a.hdr, Some(1));
         a.on_key(key(KeyCode::Char(' ')));
-        assert!(a.is_col(0));
+        assert!(a.is_col(1));
         a.on_key(key(KeyCode::Enter));
-        assert!(!a.is_col(0));
+        assert!(!a.is_col(1));
         a.hits = vec![(Rect::new(0, 3, 20, 1), Hit::Head(1))];
         a.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 2, row: 3, modifiers: KeyModifiers::NONE });
         assert!(a.is_col(1));
+    }
+
+    #[test]
+    fn no_header_for_allgemein_and_all_collapsed_hides_everything() {
+        let mut a = side_app();
+        assert!(!a.side_rows().contains(&Row::Head(0)));
+        a.toggle_all();
+        assert!(!a.is_col(0));
+        let ents = a.side_rows().iter().filter(|x| matches!(x, Row::Ent(_))).count();
+        assert_eq!(ents, 1); // Allgemein (selected + headerless); others hidden
+        a.cur = Chan::Patch(1);
+        assert_eq!(a.side_rows().iter().filter(|x| matches!(x, Row::Ent(_))).count(), 2);
+    }
+
+    #[test]
+    fn header_cursor_skips_collapsed_and_survives_refresh() {
+        let mut a = side_app();
+        a.focus = Focus::Side;
+        a.toggle_all();
+        a.on_key(key(KeyCode::Down)); // header Themen
+        assert_eq!(a.hdr, Some(1));
+        a.on_key(key(KeyCode::Down)); // header Offene (Themen collapsed, no entries)
+        assert_eq!(a.hdr, Some(2));
+        a.entries.retain(|e| e.section != 2);
+        a.on_key(key(KeyCode::Up));
+        assert!(a.hdr.is_none()); // stale header dropped
+        a.hdr = Some(2);
+        a.on_key(key(KeyCode::Down));
+        assert_eq!(a.hdr, Some(1)); // stale cleared, cursor continues from current channel
     }
 
     #[test]

@@ -155,7 +155,7 @@ fn draw_side(f: &mut Frame, a: &mut App, r: Rect) {
         if un > 0 { st = st.add_modifier(Modifier::BOLD) }
         if sel { st = st.bg(Color::Rgb(50, 56, 70)) }
         let pad = w.saturating_sub(2 + tw(&lab) + tw(&badge));
-        lines.push(Line::from(vec![sp(if sel { "▸ " } else { "  " }, st.fg(Color::Cyan)), sp(lab, st), sp(" ".repeat(pad), st),
+        lines.push(Line::from(vec![sp(if sel { "› " } else { "  " }, st.fg(Color::Cyan)), sp(lab, st), sp(" ".repeat(pad), st),
             sp(badge, st.fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -361,7 +361,7 @@ fn list_pane(f: &mut Frame, a: &mut App, r: Rect, title: &str, items: Vec<(Strin
         a.hits.push((Rect::new(inner.x, y, inner.width, 1), mk(k)));
         let s = if k == sel { st.bg(Color::Rgb(50, 56, 70)) } else { *st };
         let t = trunc(t, inner.width as usize - 2);
-        lines.push(Line::from(vec![sp(if k == sel { "▸ " } else { "  " }, s.fg(Color::Cyan)), sp(format!("{t:<w$}", w = inner.width as usize - 2), s)]));
+        lines.push(Line::from(vec![sp(if k == sel { "› " } else { "  " }, s.fg(Color::Cyan)), sp(format!("{t:<w$}", w = inner.width as usize - 2), s)]));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }

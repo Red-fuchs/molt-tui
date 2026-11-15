@@ -15,7 +15,7 @@ Looking for a browser UI? See [molt-web](https://github.com/Red-fuchs/molt-web),
  Demo Republic · Sitz: alice · 1 Aktion(en) für dich · Relays: ok (2) · 3 Mitglieder: bob, alice, ca
   1 Chat (4)   2 Vorschläge (1)   3 Wiki
 ┌ Kanäle ───────────────────────┐┌ Allgemein ──────────────────────────────────────────────────────┐
-│▸ Allgemein                   2││ 11.11 15:16 bob  ❤️                                             │
+│› Allgemein                   2││ 11.11 15:16 bob  ❤️                                             │
 │ ── Themen                     ││   Hallo zusammen,                                               │
 │  Ideen                       1││   wie läuft's? ROT evil                                         │
 │ ── Vorschläge                 ││                                                                 │
