@@ -58,29 +58,59 @@ pub fn insert(text: &str, range: Range<usize>, name: &str) -> (String, usize) {
     (o, a + ins.chars().count() + sp as usize)
 }
 
-/// Roster names mentioned in `body` (document order, deduped, canonical spelling). `@{Name}` or `@Name` at a word boundary;
-/// longest name wins; no substring hits ("@bobby" does not mention "bob").
-pub fn extract(body: &str, roster: &Roster) -> Vec<String> {
+/// Result of scanning a body: resolved canonical names + ambiguous short names (typed token, candidates).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Mentions { pub names: Vec<String>, pub ambiguous: Vec<(String, Vec<String>)> }
+
+/// Roster names whose first word (or part before " (") starts with the folded token.
+fn short<'a>(tok: &[char], roster: &'a Roster) -> Vec<&'a str> {
+    roster.iter().filter(|m| {
+        let n = fold(&m.name);
+        let w: Vec<char> = n.iter().take_while(|c| word(**c)).cloned().collect();
+        let head = n.windows(2).position(|x| x == [' ', '(']).map(|p| &n[..p]);
+        !m.name.is_empty() && (w.starts_with(tok) || head.is_some_and(|h| h.starts_with(tok)))
+    }).map(|m| m.name.as_str()).collect()
+}
+
+/// Roster names mentioned in `body` (document order, deduped, canonical spelling). `@{Name}` exact; `@Name` at a word boundary
+/// (longest full name wins, else a UNIQUE short name like `@Fren` -> "Fren (Peter)"; 2+ candidates -> reported ambiguous).
+pub fn resolve(body: &str, roster: &Roster) -> Mentions {
     let cs: Vec<char> = body.chars().collect();
     let mut names: Vec<(Vec<char>, &str)> = roster.iter().filter(|m| !m.name.is_empty()).map(|m| (fold(&m.name), m.name.as_str())).collect();
     names.sort_by_key(|n| std::cmp::Reverse(n.0.len()));
-    let mut out: Vec<String> = vec![];
+    let mut out = Mentions::default();
     let mut i = 0;
     while i < cs.len() {
         if cs[i] != '@' || (i > 0 && word(cs[i - 1])) { i += 1; continue }
         let rest: Vec<char> = cs[i + 1..].iter().map(|c| fc(*c)).collect();
         let hit = if rest.first() == Some(&'{') {
             rest.iter().position(|c| *c == '}').and_then(|e| names.iter().find(|n| n.0 == rest[1..e]).map(|n| (n.1, e + 1)))
+        } else if let Some(h) = names.iter().find(|n| rest.starts_with(&n.0) && !rest.get(n.0.len()).is_some_and(|c| word(*c) || *c == '-')) {
+            Some((h.1, h.0.len()))
         } else {
-            names.iter().find(|n| rest.starts_with(&n.0) && !rest.get(n.0.len()).is_some_and(|c| word(*c) || *c == '-')).map(|n| (n.1, n.0.len()))
+            let l = rest.iter().take_while(|c| word(**c)).count();
+            if l == 0 || rest.get(l) == Some(&'-') { None } else {
+                let c = short(&rest[..l], roster);
+                match c.len() {
+                    0 => None,
+                    1 => Some((c[0], l)),
+                    _ => {
+                        let t: String = cs[i + 1..i + 1 + l].iter().collect();
+                        if !out.ambiguous.iter().any(|a| fold(&a.0) == fold(&t)) { out.ambiguous.push((t, c.iter().map(|s| s.to_string()).collect())) }
+                        i += 1 + l; continue
+                    }
+                }
+            }
         };
         match hit {
-            Some((n, l)) => { if !out.iter().any(|o| o == n) { out.push(n.to_string()) } i += 1 + l }
+            Some((n, l)) => { if !out.names.iter().any(|o| o == n) { out.names.push(n.to_string()) } i += 1 + l }
             None => i += 1,
         }
     }
     out
 }
+
+pub fn extract(body: &str, roster: &Roster) -> Vec<String> { resolve(body, roster).names }
 
 #[cfg(test)]
 mod t {
@@ -141,5 +171,25 @@ mod t {
         assert_eq!(extract("@{nobody} @{bob}", &r), ["bob"]);
         assert_eq!(extract("@Al, @alice", &r), ["Al", "alice"]);
         assert!(extract("@alice-x", &r).is_empty());
+    }
+    #[test]
+    fn short_names() {
+        let r = r();
+        let m = |n: &str, p| Member { name: n.into(), presence: p, ..Default::default() };
+        assert_eq!(extract("hi @Fren,", &r), ["Fren (Peter)"]);
+        assert_eq!(extract("@fren!", &r), ["Fren (Peter)"]);
+        assert_eq!(resolve("@jur", &r).names, ["Jürgen"]);
+        assert_eq!(resolve("@JÜRG ok", &r).names, ["Jürgen"]);
+        assert!(extract("a@Fren.de x@fren", &r).is_empty()); // email / inside word
+        assert!(extract("@Frenn @xyz", &r).is_empty());
+        assert_eq!(extract("@{Fren (Peter)}", &r), ["Fren (Peter)"]);
+        assert!(extract("@{Fren}", &r).is_empty()); // canonical stays exact
+        let mut r2 = r.clone(); r2.push(m("Frank", 1));
+        let x = resolve("@Fr, @Fren", &r2);
+        assert!(x.names.is_empty() || x.names == ["Fren (Peter)"]);
+        let x = resolve("hi @Fr,", &r2);
+        assert!(x.names.is_empty());
+        assert_eq!(x.ambiguous, vec![("Fr".to_string(), vec!["Fren (Peter)".to_string(), "Frank".to_string()])]);
+        assert_eq!(resolve("@Fren", &r2).names, ["Fren (Peter)"]);
     }
 }

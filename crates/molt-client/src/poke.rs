@@ -47,7 +47,7 @@ pub fn targets(body: &str, roster: &Roster, me: &str, confirmed_all: bool) -> (V
     (v, skipped)
 }
 
-pub struct Outcome { pub sent: Result<Value, String>, pub pokes: Vec<(String, PokeResult)>, pub skipped: usize }
+pub struct Outcome { pub sent: Result<Value, String>, pub pokes: Vec<(String, PokeResult)>, pub skipped: usize, pub ambiguous: Vec<(String, Vec<String>)> }
 
 /// Pokes for the @mentions of an already sent `body`; returns (results, skipped by the cap).
 #[allow(clippy::too_many_arguments)]
@@ -61,21 +61,25 @@ pub fn poke_mentions(m: &Mcp, gate: &mut PokeGate, roster: &Roster, me: &str, en
 pub fn send_with_pokes(m: &Mcp, gate: &mut PokeGate, roster: &Roster, me: &str, enabled: bool, confirmed_all: bool, args: Value, now: u64) -> Outcome {
     let body = args.get("body").and_then(Value::as_str).unwrap_or("").to_string();
     let sent = m.call("chat_send", args);
-    if sent.is_err() { return Outcome { sent, pokes: vec![], skipped: 0 } }
+    if sent.is_err() { return Outcome { sent, pokes: vec![], skipped: 0, ambiguous: vec![] } }
     let (pokes, skipped) = poke_mentions(m, gate, roster, me, enabled, confirmed_all, &body, now);
-    Outcome { sent, pokes, skipped }
+    let ambiguous = crate::mention::resolve(&body, roster).ambiguous;
+    Outcome { sent, pokes, skipped, ambiguous }
 }
 
 /// Short German status for toasts; None when nothing worth saying.
+/// Also used for the persistent poke line (TUI ~10 s, web 30 s).
 pub fn summary_de(o: &Outcome) -> Option<String> {
     let mut p: Vec<String> = o.pokes.iter().map(|(n, r)| match r {
-        PokeResult::Sent => format!("{n} angestupst"),
-        PokeResult::RateLimited(s) => format!("{n}: Stups erst in {s}s"),
-        PokeResult::Disabled => format!("{n}: Stupsen ist aus"),
-        PokeResult::Offline => format!("{n} offline, kein Stups"),
+        PokeResult::Sent => format!("👋 Stups an {n} gesendet"),
+        PokeResult::RateLimited(s) => format!("Stups an {n} übersprungen: Limit 1/min (noch {s}s)"),
+        PokeResult::Disabled => "Anstupsen ist am Knoten aus".to_string(),
+        PokeResult::Offline => format!("{n} ist offline, Stups geht verloren"),
         PokeResult::Failed(e) => format!("{n}: Stups fehlgeschlagen ({})", crate::text::one(e)),
     }).collect();
     if o.skipped > 0 { p.push(format!("{} weitere Erwähnung(en) ohne Stups", o.skipped)) }
+    p.dedup();
+    for (t, c) in &o.ambiguous { let _ = t; p.push(format!("mehrdeutig: {}", c.join(", "))) }
     if p.is_empty() { None } else { Some(p.join("; ")) }
 }
 
@@ -134,5 +138,15 @@ mod t {
         let (mk, m, _) = setup();
         let o = send_with_pokes(&m, &mut PokeGate::default(), &[mem("bob", 1)], "me", true, false, json!({"body":"  "}), 1);
         assert!(o.sent.is_err() && o.pokes.is_empty() && mk.called("poke").is_empty());
+    }
+    #[test]
+    fn summary_short_and_ambiguous() {
+        let (_, m, _) = setup();
+        let r = vec![mem("Fren (Peter)", 1), mem("Frank", 1), mem("bob", 0)];
+        let o = send_with_pokes(&m, &mut PokeGate::default(), &r, "me", true, false, json!({"body":"@Fren @Fr @bob"}), 1);
+        assert_eq!(o.pokes[0].0, "Fren (Peter)");
+        let mut o = o; o.pokes[0].1 = PokeResult::Sent;
+        let s = summary_de(&o).unwrap();
+        assert!(s.contains("👋 Stups an Fren (Peter) gesendet") && s.contains("bob ist offline, Stups geht verloren") && s.contains("mehrdeutig: Fren (Peter), Frank"), "{s}");
     }
 }

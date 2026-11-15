@@ -77,6 +77,8 @@ impl App {
         }
     }
 
+    /// Poke summary line: persists ~10 s (vs 4 s).
+    pub fn toast_long(&mut self, s: impl Into<String>, err: bool) { self.toast = Some((s.into(), err, Instant::now() + std::time::Duration::from_secs(6))) }
     pub fn toast(&mut self, s: impl Into<String>, err: bool) { self.toast = Some((s.into(), err, Instant::now())) }
     fn req(&self, tag: Tag, name: &'static str, args: Value) { if let Some(t) = &self.tx { let _ = t.send(Req { tag, name, args }); } }
     fn poke(&self) { if let Some(n) = &self.nudge { let _ = n.send(()); } }
@@ -115,8 +117,11 @@ impl App {
             Ev::Reply(tag, r) => match (tag, r) {
                 (Tag::Send, Ok(v)) => {
                     self.sending = false; self.ed.clear(); self.quote = None; self.scroll = 0; self.sel = None;
-                    let extra = v.get("@pokes").and_then(Value::as_str).map(|t| format!(" · {t}")).unwrap_or_default();
-                    self.toast(format!("Gesendet{extra}"), false); self.poke();
+                    match v.get("@pokes").and_then(Value::as_str) {
+                        Some(t) => self.toast_long(format!("Gesendet · {t}"), false),
+                        None => self.toast("Gesendet", false),
+                    }
+                    self.poke();
                 }
                 (Tag::Send, Err(e)) => { self.sending = false; self.toast(format!("Senden fehlgeschlagen: {}", one(&e)), true) }
                 (Tag::Vote(id, a), Ok(_)) => {
@@ -540,6 +545,8 @@ impl App {
             End => e.mv(if ctrl { Mv::Bottom } else { Mv::End }, shift, w),
             PageUp => self.scroll += 10,
             PageDown => self.scroll = self.scroll.saturating_sub(10),
+            // Terminal.app with 'Option as Meta': Option+L arrives as ESC l = Alt+l; map the German Mac option layer back
+            Char(c) if alt && !ctrl && de_option(c).is_some() => { if let Some(x) = de_option(c) { e.insert_str(&x.to_string()) } }
             // German Mac: @ { } [ ] | ~ \\ are Option+key; the terminal reports the char with ALT, so only alt+letter/digit are shortcuts
             Char(c) if !ctrl && (!alt || !c.is_alphanumeric()) => e.insert_str(&c.to_string()),
             _ => {}
@@ -870,6 +877,13 @@ mod t {
         for c in ['@', '{', '}', '[', '|'] { a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)) }
         assert_eq!(a.ed.text(), "@{}[|");
     }
+    #[test]
+    fn option_as_meta_fallback() {
+        let (mut a, _rx) = app();
+        a.focus = Focus::Input;
+        for c in ['l', '8', '9', '5', '6', '7', 'n'] { a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)) }
+        assert_eq!(a.ed.text(), "@{}[]|~");
+    }
     fn ctrl(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL) }
     fn typ(a: &mut App, s: &str) { for c in s.chars() { a.on_key(key(KeyCode::Char(c))) } }
     #[test]
@@ -972,4 +986,9 @@ mod t {
         a.on_key(key(KeyCode::Enter));
         assert_eq!(a.cur, Chan::Topic("Ideen2".into()));
     }
+}
+
+/// German Mac option layer for terminals that send Option as Meta (ESC + base key): l=@ 5=[ 6=] 7=| 8={ 9=} n=~
+pub fn de_option(c: char) -> Option<char> {
+    Some(match c { 'l' => '@', '5' => '[', '6' => ']', '7' => '|', '8' => '{', '9' => '}', 'n' => '~', _ => return None })
 }
