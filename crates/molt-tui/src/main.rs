@@ -91,7 +91,13 @@ fn main() {
         match std::fs::read_to_string(&f) { Ok(t) => unsafe { std::env::set_var("MOLT_TOKEN", t.trim()) }, Err(e) => { eprintln!("molt-tui: {f}: {e}"); std::process::exit(2) } }
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("molt-tui — Terminal-UI für den MoltRepublic-Sitz (moltd)\n\n  molt-tui                         interaktiv\n  molt-tui --dump|--once [--tab chat|props|wiki] [--chan group|patch:N|topic:NAME] [--sel N] [--size WxH]\n                                   einen Frame als Text ausgeben (nur lesende Aufrufe)\n\nAbsender-Tag: jede Nachricht beginnt mit [MOLT_ID] (Default Redfuchs, MOLT_ID=- aus)\nConfig (in Reihenfolge): --url/--token-file, env MOLT_URL/MOLT_TOKEN, ~/.config/molt/url + token, Default http://127.0.0.1:4040/mcp\nHilfe in der App: F1 oder ?");
+        println!("molt-tui — Terminal-UI für den MoltRepublic-Sitz (moltd)\n\n  molt-tui                         interaktiv\n  molt-tui --dump|--once [--tab chat|props|wiki] [--chan group|patch:N|topic:NAME] [--sel N] [--size WxH]\n                                   einen Frame als Text ausgeben (nur lesende Aufrufe)\n  molt-tui --diag chain|mirror|wake|log [Filter]|upload ID\n                                   Diagnose (nur lesend; log enthält Peer-IPs)\n\nAbsender-Tag: jede Nachricht beginnt mit [MOLT_ID] (Default Redfuchs, MOLT_ID=- aus)\nConfig (in Reihenfolge): --url/--token-file, env MOLT_URL/MOLT_TOKEN, ~/.config/molt/url + token, Default http://127.0.0.1:4040/mcp\nHilfe in der App: F1 oder ?");
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--diag") {
+        let m = match Mcp::new() { Ok(m) => m, Err(e) => { eprintln!("molt-tui: {e}"); std::process::exit(2) } };
+        let (w, q) = (args.get(i + 1).map_or("", String::as_str), args.get(i + 2).map_or("", String::as_str));
+        match molt_client::diag::view(&m, w, q) { Ok(t) => println!("{t}"), Err(e) => { eprintln!("molt-tui: {e}"); std::process::exit(2) } }
         return;
     }
     if args.iter().any(|a| a == "--dump" || a == "--once") { std::process::exit(dump(&args)) }

@@ -73,7 +73,7 @@ pub mod sim {
 
     pub struct Sim {
         pub seat: String, pub members: Vec<String>, pub threshold: u64, pub msgs: Vec<Value>, pub props: Vec<Value>,
-        pub uploads: Vec<Value>, pub pages: Vec<String>, pub contents: Vec<(String, String)>, pub foreign: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, pub poke_enabled: bool, pub clock: i64, pub pokes: Vec<(String, i64)>, pub closed: Vec<String>, pub reads: Vec<String>, n: u64, next_prop: u64,
+        pub uploads: Vec<Value>, pub pages: Vec<String>, pub contents: Vec<(String, String)>, pub foreign: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, pub poke_enabled: bool, pub clock: i64, pub pokes: Vec<(String, i64)>, pub closed: Vec<String>, pub reads: Vec<String>, pub log: Vec<String>, pub notices: Vec<String>, n: u64, next_prop: u64,
     }
 
     fn hex_id(n: u64) -> String { format!("{n:032x}") }
@@ -83,7 +83,7 @@ pub mod sim {
         /// Seat `seat`, members bob + carol, threshold 2; proposal 4 (open, by bob) and 1 (applied) exist.
         pub fn new(seat: &str) -> Sim {
             let mut m = Sim { seat: seat.into(), members: vec!["bob".into(), "carol".into(), seat.into()], threshold: 2, msgs: vec![], props: vec![],
-                uploads: vec![], pages: vec!["home.md".into()], contents: vec![("home.md".into(), "---\ntype: meta\ntitle: Start\n---\n\n# Start\n".into())], foreign: vec!["home.md".into()], blobs: vec![], poke_enabled: true, clock: 1_000, pokes: vec![], closed: vec![], reads: vec![], n: 100, next_prop: 5 };
+                uploads: vec![], pages: vec!["home.md".into()], contents: vec![("home.md".into(), "---\ntype: meta\ntitle: Start\n---\n\n# Start\n".into())], foreign: vec!["home.md".into()], blobs: vec![], poke_enabled: true, clock: 1_000, pokes: vec![], closed: vec![], reads: vec![], log: vec![], notices: vec![], n: 100, next_prop: 5 };
             m.props.push(json!({"id":1,"state":"applied","by":"bob","surface":"memory","payload":{"op":"add_note","title":"Alt"},"approvals":2,"threshold":2,
                 "votes":[{"member":"bob","vote":"approved"},{"member":"carol","vote":"approved"}],"approved_by_me":false,"declined_by_me":false}));
             m.props.push(json!({"id":4,"state":"proposed","by":"bob","surface":"memory","payload":{"op":"wiki_patch","summary":"+1","value":"diff --git a/neu.md b/neu.md\nnew file mode 100644\n--- /dev/null\n+++ b/neu.md\n@@ -0,0 +1 @@\n+Hallo\n"},
@@ -205,6 +205,16 @@ pub mod sim {
                     self.pokes.push((t, self.clock));
                     Ok(json!({"ok":true}))
                 })(),
+                "read_log" => Ok(json!({"lines":self.log})),
+                "read_chain" => Ok(json!({"head":"abc","height":3})),
+                "read_mirror" => Ok(json!({"mirror":"in-sync"})),
+                "wake_skill" => Ok(json!("How to wake: run the script")),
+                "test_wake" => Ok(json!({"ok":true,"ran":"wake"})),
+                "clear_notice" => {
+                    match a.get("id").and_then(Value::as_str) { Some(i) => self.notices.retain(|n| n != i), None => self.notices.clear() }
+                    Ok(json!({"ok":true}))
+                }
+                "resolve_upload" => (|| { let id = s(a, "checksum"); self.uploads.iter().find(|u| s(u, "id") == id).cloned().ok_or_else(|| "unknown upload".to_string()).or_else(|_| if id.len() == 32 { Ok(json!({"id":id,"available":false})) } else { Err("bad id".to_string()) }) })(),
                 "read_uploads" => Ok(json!({"uploads":self.uploads})),
                 "download_file" => (|| {
                     let id = s(a, "id");

@@ -48,6 +48,8 @@ pub struct Upload {
     pub id: String, pub name: String, pub kind: String, pub member: String, pub size: u64, pub ts: i64,
     pub expires_ts: i64, pub persistent: bool, pub availability: String, pub local: String,
     pub online: bool, pub available: bool,
+    /// open vote on this share: (op, proposal id, mine_open)
+    pub vote: Option<(String, u64, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,7 +142,7 @@ pub fn parse_uploads(v: &Value) -> Vec<Upload> {
         id: s(m, "id"), name: s(m, "name"), kind: s(m, "kind"), member: s(m, "member"), size: u(m, "size"),
         ts: m.get("ts").and_then(Value::as_i64).unwrap_or(0), expires_ts: m.get("expires_ts").and_then(Value::as_i64).unwrap_or(0),
         persistent: b(m, "persistent"), availability: s(m, "availability"), local: s(m, "local"),
-        online: b(m, "online"), available: b(m, "available"),
+        online: b(m, "online"), available: b(m, "available"), vote: crate::diag::upload_vote(m),
     }).collect()
 }
 

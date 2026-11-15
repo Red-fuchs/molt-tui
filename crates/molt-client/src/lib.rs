@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod diag;
 pub mod compose;
 pub mod mcp;
 pub mod mention;
