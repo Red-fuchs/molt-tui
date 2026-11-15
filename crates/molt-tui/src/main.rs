@@ -1,5 +1,10 @@
 mod app;
 mod editor;
+mod imglay;
+mod imgs;
+mod pixel;
+mod imglru;
+mod viewer;
 pub use molt_client::{mcp, model};
 mod text;
 mod ui;
@@ -63,6 +68,16 @@ fn dump(args: &[String]) -> i32 {
         _ => {}
     }
     let (w, h) = arg(args, "--size").and_then(|s| s.split_once('x').map(|(a, b)| (a.parse().ok(), b.parse().ok()))).map_or((110, 36), |(w, h)| (w.unwrap_or(110), h.unwrap_or(36)));
+    if a.tab == View::Chat && imgs::mode_of(std::env::var("MOLT_IMAGES").ok().as_deref()) != imgs::Mode::Off {
+        // read-only: download_file only writes into the local cache; show pixel-art previews of the newest images
+        a.imgs.px = true;
+        let cache = imgs::cache_dir();
+        let mut v: Vec<_> = a.msgs().into_iter().filter(|m| imgs::is_img(m)).cloned().collect();
+        let n = v.len().saturating_sub(4);
+        for msg in v.drain(n..) {
+            if let Some(meta) = msg.file.clone() { let r = imgs::load(&m, &cache, &imgs::ImgReq { id: msg.id.clone(), meta }); a.imgs.on_loaded(msg.id, r) }
+        }
+    }
     print!("{}", ui::dump(&mut a, w, h));
     0
 }
@@ -85,6 +100,8 @@ fn main() {
     let (rtx, rrx) = mpsc::channel::<Req>();
     let (ntx, nrx) = mpsc::channel::<()>();
     let t1 = tx.clone();
+    let (itx, irx) = mpsc::channel::<imgs::ImgReq>();
+    match Mcp::new() { Ok(m) => imgs::spawn_worker(m, irx, tx.clone()), Err(_) => {} }
     std::thread::spawn(move || loop {
         if t1.send(Ev::Snap(model::fetch_snap(&poll))).is_err() { break }
         let _ = nrx.recv_timeout(Duration::from_secs(3));
@@ -107,12 +124,17 @@ fn main() {
     let kb = supports_keyboard_enhancement().unwrap_or(false);
     let mut out = std::io::stdout();
     let _ = execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste);
+    let imode = imgs::mode();
+    let picker = if imode == imgs::Mode::Graphics { Some(imgs::make_picker()) } else { None };
     if kb { let _ = execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)); }
-    let mut term = Terminal::new(CrosstermBackend::new(out)).expect("terminal");
+    let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).expect("terminal");
 
     let mut a = App::new(text::tz_offset());
     a.tx = Some(rtx);
     a.nudge = Some(ntx);
+    if imode != imgs::Mode::Off { a.imgs.tx = Some(itx) }
+    a.imgs.px = imode == imgs::Mode::Pixel;
+    a.imgs.picker = picker;
     let mut dirty = true;
     while !a.quit {
         while let Ok(ev) = rx.try_recv() { a.on_ev(ev); dirty = true }

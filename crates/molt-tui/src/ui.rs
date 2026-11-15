@@ -1,5 +1,9 @@
+use molt_client::chat;
 use crate::app::*;
 use crate::model::*;
+use crate::imglay::{self, ImgState};
+use crate::imgs::Slot;
+use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
 use crate::text::{fmt_ts, one, trunc, w as tw, wrap};
 use ratatui::layout::{Constraint::*, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -50,6 +54,27 @@ pub fn draw(f: &mut Frame, a: &mut App) {
     draw_foot(f, a, foot);
     if let Some(m) = &a.modal { draw_modal(f, a, m) }
     if a.help { draw_help(f) }
+    if a.imgs.viewer.is_some() { draw_viewer(f, a) }
+}
+
+fn draw_viewer(f: &mut Frame, a: &mut App) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let [img, foot] = Layout::vertical([Min(1), Length(1)]).areas(area);
+    let Some(v) = a.imgs.viewer.clone() else { return };
+    let (n, tot) = v.pos();
+    let name = a.snap.msgs.iter().find(|m| m.id == v.cur()).and_then(|m| m.file.as_ref()).map_or(String::new(), |f| molt_client::files::safe_name(&f.name));
+    if a.imgs.px {
+        let c = v.cur().to_string();
+        let (iw, ih) = match a.imgs.slots.get(&c) { Some(Slot::Ready { w, h, .. }) => (*w, *h), _ => (0, 0) };
+        let (cols, rows) = imglay::fit_cells(iw, ih, 1, 2, img.width, img.height);
+        let r = Rect::new(img.x + (img.width - cols) / 2, img.y, cols, rows);
+        match a.imgs.pixels(&c) { Some(p) => crate::pixel::render(p, r, f.buffer_mut()), None => f.render_widget(Paragraph::new(sp(" Bild wird geladen …", DIM)), img) }
+    } else { match a.imgs.proto(v.cur()) {
+        Some(p) => f.render_stateful_widget(StatefulImage::<StatefulProtocol>::default(), img, p),
+        None => f.render_widget(Paragraph::new(sp(" Bild wird geladen …", DIM)), img),
+    } }
+    f.render_widget(Paragraph::new(sp(format!(" {n}/{tot}  {name}  ←/→ blättern  Esc schließen"), DIM)), foot);
 }
 
 fn draw_top(f: &mut Frame, a: &App, r: Rect) {
@@ -133,16 +158,21 @@ fn draw_side(f: &mut Frame, a: &mut App, r: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-pub fn msg_lines(a: &App, wd: usize) -> (Vec<Line<'static>>, Vec<(String, usize, usize)>) {
+pub type Blk = (String, usize, usize, u16, u16);
+
+pub fn msg_lines(a: &App, wd: usize) -> (Vec<Line<'static>>, Vec<(String, usize, usize)>, Vec<Blk>) {
     let mut lines: Vec<Line<'static>> = vec![];
     let mut ranges = vec![];
+    let mut blks: Vec<Blk> = vec![];
     for m in a.msgs() {
         let start = lines.len();
         let sel = a.sel.as_deref() == Some(m.id.as_str());
         let bg = if sel { Style::new().bg(Color::Rgb(40, 44, 58)) } else { Style::new() };
         let bar = |s: &str| sp(s.to_string(), if sel { Style::new().fg(Color::Cyan) } else { Style::new() });
         let mut h = vec![bar(if sel { "▌" } else { " " }), sp(format!("{} ", fmt_ts(m.ts, a.off)), DIM), sp(m.from.clone(), who(&m.from, a.me()))];
-        for (e, n) in &m.reactions { h.push(sp(format!("  {e}{}", if *n > 1 { format!("×{n}") } else { String::new() }), DIM)) }
+        let mine = m.reacted(a.me());
+        for (e, n) in &m.reactions { h.push(sp(format!("  {e}{}", if *n > 1 { format!("×{n}") } else { String::new() }), if mine.contains(&e.as_str()) { Style::new().fg(Color::Cyan) } else { DIM })) }
+        if m.deleted { h.push(sp("  (gelöscht)", DIM)) }
         lines.push(Line::from(h).style(bg));
         if let Some(q) = &m.quote {
             let t = match a.snap.msgs.iter().find(|x| &x.id == q) {
@@ -152,10 +182,29 @@ pub fn msg_lines(a: &App, wd: usize) -> (Vec<Line<'static>>, Vec<(String, usize,
             lines.push(Line::from(vec![bar(" "), sp(format!(" {}", trunc(&t, wd.saturating_sub(3))), DIM.add_modifier(Modifier::ITALIC))]).style(bg));
         }
         for l in wrap(&m.body, wd.saturating_sub(4).max(1)) { lines.push(Line::from(vec![bar(" "), sp(format!("  {l}"), Style::new())]).style(bg)) }
+        if let Some(f) = &m.file {
+            let name = molt_client::files::safe_name(&f.name);
+            if crate::imgs::is_img(m) {
+                let slot = a.imgs.slots.get(&m.id);
+                let gif = matches!(slot, Some(Slot::Ready { gif: true, .. })) || name.to_ascii_lowercase().ends_with(".gif");
+                let st = if a.imgs.on { a.imgs.state(&m.id) } else { ImgState::Off };
+                lines.push(Line::from(vec![bar(" "), sp(format!("  {}", imglay::caption(&name, f.size, gif, &st)), DIM)]).style(bg));
+                if let (true, Some(Slot::Ready { w, h, .. })) = (a.imgs.on, slot) {
+                    let (c, r) = imglay::fit_cells(*w, *h, a.imgs.font().0, a.imgs.font().1, wd.saturating_sub(4).min(if a.imgs.px { 56 } else { u16::MAX as usize }) as u16, 10);
+                    if r > 0 {
+                        let s = lines.len();
+                        for _ in 0..r { lines.push(Line::from(bar(" ")).style(bg)) }
+                        blks.push((m.id.clone(), s, lines.len(), c, r));
+                    }
+                }
+            } else {
+                lines.push(Line::from(vec![bar(" "), sp(format!("  📎 {name} ({})", imglay::human_size(f.size)), DIM)]).style(bg));
+            }
+        }
         ranges.push((m.id.clone(), start, lines.len()));
         lines.push(Line::default());
     }
-    (lines, ranges)
+    (lines, ranges, blks)
 }
 
 fn draw_chat(f: &mut Frame, a: &mut App, area: Rect) {
@@ -166,7 +215,7 @@ fn draw_chat(f: &mut Frame, a: &mut App, area: Rect) {
     let inner = b.inner(main);
     f.render_widget(b, main);
     a.main_rect = inner;
-    let (lines, ranges) = msg_lines(a, inner.width as usize);
+    let (lines, ranges, blks) = msg_lines(a, inner.width as usize);
     let (h, total) = (inner.height as usize, lines.len());
     if lines.is_empty() {
         let t = if matches!(a.cur, Chan::Topic(_)) && a.msgs().is_empty() { "Neues Thema: die erste Nachricht legt es an." } else { "Noch keine Nachrichten in diesem Kanal." };
@@ -191,6 +240,14 @@ fn draw_chat(f: &mut Frame, a: &mut App, area: Rect) {
         }
     }
     f.render_widget(Paragraph::new(lines[top..(top + h).min(total)].to_vec()), inner);
+    if a.modal.is_none() && !a.help && a.imgs.viewer.is_none() {
+        for (id, s, e, c, r) in &blks {
+            if imglay::vis(*s, *e, top, h) != imglay::Vis::Full { continue }
+            let rect = Rect::new(inner.x + 3, inner.y + (*s - top) as u16, (*c).min(inner.width.saturating_sub(3)), *r);
+            if a.imgs.px { if let Some(p) = a.imgs.pixels(id) { crate::pixel::render(p, rect, f.buffer_mut()) } }
+            else if let Some(p) = a.imgs.proto(id) { f.render_stateful_widget(StatefulImage::<StatefulProtocol>::default(), rect, p) }
+        }
+    }
     if a.scroll > 0 {
         let t = format!(" ↓ {} Zeilen weiter unten (End) ", a.scroll);
         let wd = tw(&t) as u16;
@@ -369,8 +426,8 @@ fn draw_foot(f: &mut Frame, a: &App, r: Rect) {
     }
     let h = match (a.tab, a.focus) {
         (View::Chat, Focus::Input) => "Enter senden · Alt+Enter Zeile · Tab Fokus · Ctrl+N Thema · F1 Hilfe",
-        (View::Chat, Focus::Main) => "↑↓ Nachricht · r antworten · c kopieren · m gelesen · i schreiben · ? Hilfe",
-        (View::Chat, Focus::Side) => "↑↓ Kanal · Enter öffnen · n neues Thema · m gelesen · ? Hilfe",
+        (View::Chat, Focus::Main) => "↑↓ Nachricht · r antworten · e reagieren · x löschen · u Freigabe weg · m/M gelesen · i schreiben · ? Hilfe",
+        (View::Chat, Focus::Side) => "↑↓ Kanal · Enter öffnen · n neu · x schließen · o öffnen · F vergessen · m gelesen · ? Hilfe",
         (View::Props, _) => "↑↓ wählen · a zustimmen · d ablehnen · n neu · w zurückziehen · t Diskussion · ? Hilfe",
         (View::Wiki, _) => "↑↓ Dokument/scrollen · Enter lesen · Tab Fokus · ? Hilfe",
     };
@@ -410,6 +467,35 @@ fn draw_modal(f: &mut Frame, a: &App, m: &Modal) {
                 Line::from("Er wird für alle Mitglieder beendet und lässt sich nicht wieder öffnen."), Line::default(),
                 Line::from(sp("J = ja, zurückziehen · N/Esc = abbrechen", BOLD))], Color::Red)
         }
+        Modal::React(_) => (" Reagieren ".into(), vec![
+            Line::from(chat::REACTIONS.iter().enumerate().map(|(i, e)| sp(format!(" {} {e} ", i + 1), BOLD)).collect::<Vec<_>>()), Line::default(),
+            Line::from(sp("Zahl wählt (nochmal dasselbe = zurücknehmen) · Esc abbrechen", DIM))], Color::Cyan),
+        Modal::Delete(id) => {
+            let t = a.snap.msgs.iter().find(|m| &m.id == id).map(|m| trunc(&one(&m.body), 70)).unwrap_or_default();
+            (" Nachricht löschen ".into(), vec![
+                Line::from(sp("Eigene Nachricht wirklich LÖSCHEN?", BOLD.fg(Color::Yellow))), Line::from(sp(t, DIM)), Line::default(),
+                Line::from("Der Text wird für alle Mitglieder gelöscht und durch einen Hinweis ersetzt. Nicht rückgängig."), Line::default(),
+                Line::from(sp("J = ja, löschen · N/Esc = abbrechen", BOLD))], Color::Red)
+        }
+        Modal::Unshare(id) => {
+            let t = a.snap.msgs.iter().find(|m| &m.id == id).and_then(|m| m.file.as_ref().map(|f| f.name.clone())).unwrap_or_default();
+            (" Freigabe zurückziehen ".into(), vec![
+                Line::from(sp("Eigene Dateifreigabe wirklich zurückziehen?", BOLD.fg(Color::Yellow))), Line::from(sp(trunc(&one(&t), 70), DIM)), Line::default(),
+                Line::from("Die Datei ist danach für niemanden mehr abrufbar."), Line::default(),
+                Line::from(sp("J = ja, zurückziehen · N/Esc = abbrechen", BOLD))], Color::Red)
+        }
+        Modal::Thread(op, n) => {
+            let (t, d) = if *op == chat::Thread::Close { ("schließen", "Das Thema nimmt keine Nachrichten mehr an und endet nach einem Tag; jedes Mitglied kann es vorher wieder öffnen (o).") } else { ("wieder öffnen", "Das Thema nimmt wieder Nachrichten an.") };
+            (format!(" Thema {t} "), vec![
+                Line::from(sp(format!("Thema \"{}\" für ALLE Mitglieder {t}?", trunc(&one(n), 50)), BOLD.fg(Color::Yellow))), Line::default(),
+                Line::from(d), Line::default(), Line::from(sp("J = ja · N/Esc = abbrechen", BOLD))], Color::Red)
+        }
+        Modal::Forget(n, t) => (" Thema vergessen (nur dieser Sitz) ".into(), vec![
+            Line::from(sp(format!("Thema \"{}\" auf DIESEM Sitz vergessen?", trunc(&one(n), 50)), BOLD.fg(Color::Yellow))), Line::default(),
+            Line::from("Alle lokalen Nachrichten des Themas werden gelöscht. Die anderen Mitglieder behalten es."),
+            Line::from("Zur Bestätigung den Namen des Themas eintippen:"),
+            Line::from(vec![sp(format!("> {t}"), Style::new()), sp("▏", Style::new().fg(Color::Cyan))]), Line::default(),
+            Line::from(sp("Enter bestätigen (Name muss stimmen) · Esc abbrechen", BOLD))], Color::Red),
         Modal::Propose(p) => { draw_propose(f, p); return }
         Modal::NewTopic(t) => (" Neues Thema ".into(), vec![
             Line::from("Name des Themas (max. 64 Zeichen); es entsteht mit der ersten Nachricht:"), Line::default(),
@@ -471,7 +557,7 @@ fn draw_help(f: &mut Frame) {
         h("Allgemein"),
         k("F1 / ?", "Hilfe"), k("F3 F4 F5 / 1 2 3", "Chat · Vorschläge · Wiki (Tabs auch klickbar)"),
         k("Tab / Shift+Tab", "Fokus: Kanäle → Nachrichten → Eingabe"), k("Ctrl+N / Ctrl+P", "neues Thema / neuer Vorschlag"),
-        k("Ctrl+R", "jetzt aktualisieren"), k("F6", "Rückfrage vor dem Senden an/aus"),
+        k("Ctrl+R", "jetzt aktualisieren"), k("F6", "Rückfrage vor dem Senden an/aus"), k("F7", "Bilder im Chat an/aus (Enter/o = Vollbild)"),
         k("Ctrl+C / q", "beenden (q nur wenn du nicht tippst)"),
         h("Maus"),
         k("F2", "Maus an/aus. Bei an: Klicken/Scrollen; zum Markieren+Kopieren mit dem Terminal"),
@@ -480,7 +566,9 @@ fn draw_help(f: &mut Frame) {
         k("Mausrad", "Nachrichten, Diff, Wiki scrollen"),
         h("Nachrichten (Fokus Mitte)"),
         k("↑ ↓ PgUp PgDn End", "wählen / scrollen / nach unten"), k("r oder Enter", "auf Nachricht antworten (Zitat)"),
-        k("c / C", "Text / mit Absender nach pbcopy"), k("m", "Kanal als gelesen markieren"),
+        k("c / C", "Text / mit Absender nach pbcopy"), k("m / M", "Kanal / gewählte Nachricht als gelesen markieren"),
+        k("e", "reagieren (1-6, nochmal = zurücknehmen)"), k("x", "eigene Nachricht löschen (J)"), k("u", "eigene Dateifreigabe zurückziehen (J)"),
+        k("Kanäle: x / o / F", "Thema schließen / öffnen (J) / lokal vergessen (Name tippen)"),
         h("Eingabe"),
         k("Enter", "senden (mit Rückfrage)"), k("Alt+Enter, Shift+Enter, Ctrl+J", "neue Zeile"),
         k("← → ↑ ↓ Home End", "Cursor (Shift = markieren)"), k("Alt+← → (Ctrl+← →)", "wortweise"),
@@ -509,8 +597,12 @@ pub fn dump(a: &mut App, wd: u16, ht: u16) -> String {
         let mut line = String::new();
         let mut x = 0;
         while x < wd {
-            let s = buf[(x, y)].symbol();
-            line.push_str(s);
+            let c = &buf[(x, y)];
+            let s = c.symbol();
+            match (s, c.fg, c.bg) {
+                ("▀", Color::Indexed(t), Color::Indexed(b)) => line.push(crate::pixel::half(t, b)),
+                _ => line.push_str(s),
+            }
             x += (s.width() as u16).max(1);
         }
         out.push_str(line.trim_end());
@@ -543,6 +635,36 @@ mod t {
         a.update_pop();
         let s = dump(&mut a, 100, 30);
         assert!(s.contains("@ Mitglied") && s.contains("● bob") && !s.contains("● alice"), "{s}");
+    }
+    #[test]
+    fn image_caption_in_dump_and_no_fetch() {
+        // needs files::is_image/safe_name (Qwen package) - red until filled
+        let mut snap = fixtures::snap();
+        let mut m = snap.msgs[0].clone();
+        m.id = "9".repeat(32); m.ts += 99; m.body = String::new(); m.kind = "file".into();
+        m.file = Some(FileMeta { name: "../x\u{1b}y.PNG".into(), kind: "image".into(), size: 2048, checksum: String::new() });
+        snap.msgs.push(m);
+        let mut a = App::new(0);
+        a.on_ev(Ev::Snap(Ok(snap)));
+        let s = dump(&mut a, 100, 30);
+        assert!(s.contains("🖼 xy.PNG (2.0 KB)") && !s.contains("wird geprüft"), "{s}");
+        assert!(a.imgs.slots.is_empty(), "dump never fetches");
+    }
+    #[test]
+    fn pixel_art_preview_in_dump() {
+        let mut snap = fixtures::snap();
+        let mut m = snap.msgs[0].clone();
+        m.id = "8".repeat(32); m.ts += 99; m.body = String::new(); m.kind = "file".into();
+        m.file = Some(FileMeta { name: "p.png".into(), kind: "image".into(), size: 100, checksum: String::new() });
+        snap.msgs.push(m.clone());
+        let mut a = App::new(0);
+        a.on_ev(Ev::Snap(Ok(snap)));
+        a.imgs.px = true;
+        let mut im = image::RgbImage::new(16, 8);
+        for (x, _, p) in im.enumerate_pixels_mut() { *p = if x < 8 { image::Rgb([255, 255, 255]) } else { image::Rgb([0, 0, 0]) } }
+        a.imgs.on_loaded(m.id.clone(), Ok((image::DynamicImage::ImageRgb8(im), false)));
+        let s = dump(&mut a, 100, 40);
+        assert!(s.contains("p.png") && s.contains("████████"), "{s}");
     }
     #[test]
     fn error_banner() {

@@ -73,7 +73,7 @@ pub mod sim {
 
     pub struct Sim {
         pub seat: String, pub members: Vec<String>, pub threshold: u64, pub msgs: Vec<Value>, pub props: Vec<Value>,
-        pub uploads: Vec<Value>, pub pages: Vec<String>, pub contents: Vec<(String, String)>, pub foreign: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, pub poke_enabled: bool, pub clock: i64, pub pokes: Vec<(String, i64)>, n: u64, next_prop: u64,
+        pub uploads: Vec<Value>, pub pages: Vec<String>, pub contents: Vec<(String, String)>, pub foreign: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, pub poke_enabled: bool, pub clock: i64, pub pokes: Vec<(String, i64)>, pub closed: Vec<String>, pub reads: Vec<String>, n: u64, next_prop: u64,
     }
 
     fn hex_id(n: u64) -> String { format!("{n:032x}") }
@@ -83,7 +83,7 @@ pub mod sim {
         /// Seat `seat`, members bob + carol, threshold 2; proposal 4 (open, by bob) and 1 (applied) exist.
         pub fn new(seat: &str) -> Sim {
             let mut m = Sim { seat: seat.into(), members: vec!["bob".into(), "carol".into(), seat.into()], threshold: 2, msgs: vec![], props: vec![],
-                uploads: vec![], pages: vec!["home.md".into()], contents: vec![("home.md".into(), "---\ntype: meta\ntitle: Start\n---\n\n# Start\n".into())], foreign: vec!["home.md".into()], blobs: vec![], poke_enabled: true, clock: 1_000, pokes: vec![], n: 100, next_prop: 5 };
+                uploads: vec![], pages: vec!["home.md".into()], contents: vec![("home.md".into(), "---\ntype: meta\ntitle: Start\n---\n\n# Start\n".into())], foreign: vec!["home.md".into()], blobs: vec![], poke_enabled: true, clock: 1_000, pokes: vec![], closed: vec![], reads: vec![], n: 100, next_prop: 5 };
             m.props.push(json!({"id":1,"state":"applied","by":"bob","surface":"memory","payload":{"op":"add_note","title":"Alt"},"approvals":2,"threshold":2,
                 "votes":[{"member":"bob","vote":"approved"},{"member":"carol","vote":"approved"}],"approved_by_me":false,"declined_by_me":false}));
             m.props.push(json!({"id":4,"state":"proposed","by":"bob","surface":"memory","payload":{"op":"wiki_patch","summary":"+1","value":"diff --git a/neu.md b/neu.md\nnew file mode 100644\n--- /dev/null\n+++ b/neu.md\n@@ -0,0 +1 @@\n+Hallo\n"},
@@ -111,9 +111,11 @@ pub mod sim {
             self.msgs.push(m);
             id
         }
+        /// A plain message from `from` (tests: foreign senders on the shared seat).
+        pub fn say_text(&mut self, from: &str, body: &str, chan: Option<Value>) -> String { self.say(from, body, chan, None) }
         /// A file share in the group chat: bytes served by `download_file`. `checksum` None = real sha256 of `bytes`.
         pub fn say_file(&mut self, from: &str, name: &str, kind: &str, bytes: &[u8], checksum: Option<&str>) -> String {
-            let sum = checksum.map(str::to_string).unwrap_or_else(|| { use sha2::Digest; sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect() });
+            let sum = checksum.map(str::to_string).unwrap_or_else(|| crate::files::sha256_hex(bytes));
             let id = self.say(from, "", None, None);
             if let Some(m) = self.msgs.last_mut() {
                 m["kind"] = json!("file");
@@ -225,16 +227,69 @@ pub mod sim {
                     for c in seen {
                         let n = self.msgs.iter().filter(|m| m.get("channel").cloned().unwrap_or(json!({"kind":"group"})) == c).count();
                         let last = self.msgs.iter().filter(|m| m.get("channel").cloned().unwrap_or(json!({"kind":"group"})) == c).map(|m| m["ts"].as_i64().unwrap_or(0)).max().unwrap_or(0);
-                        ch.push(json!({"channel":c,"count":n,"unread":0,"last_ts":last}));
+                        let mut e = json!({"channel":c,"count":n,"unread":0,"last_ts":last});
+                        if s(&c, "kind") == "topic" { e["closed"] = json!(self.closed.iter().any(|x| x == s(&c, "name"))) }
+                        ch.push(e);
                     }
                     Ok(json!({"wiki_rev":1,"channels":ch,"applied":self.msgs}))
+                }
+                "react_chat" => (|| {
+                    let (id, e) = (s(a, "id").to_string(), s(a, "emoji").to_string());
+                    if e.is_empty() || e.chars().count() > 8 { return Err("invalid emoji".to_string()) }
+                    let seat = self.seat.clone();
+                    let m = self.msgs.iter_mut().find(|m| s(m, "id") == id).ok_or("unknown message")?;
+                    let mut r = m.get("reactions").and_then(Value::as_object).cloned().unwrap_or_default();
+                    let had = r.get(&e).and_then(Value::as_array).is_some_and(|v| v.iter().any(|x| x == &json!(seat)));
+                    for v in r.values_mut() { if let Some(l) = v.as_array_mut() { l.retain(|x| x != &json!(seat)) } }
+                    if !had { r.entry(e.clone()).or_insert_with(|| json!([])).as_array_mut().unwrap().push(json!(seat)) }
+                    r.retain(|_, v| v.as_array().is_some_and(|l| !l.is_empty()));
+                    m["reactions"] = Value::Object(r);
+                    Ok(json!({"ok":true,"reacted":!had}))
+                })(),
+                "delete_chat" => (|| {
+                    let id = s(a, "id").to_string();
+                    let seat = self.seat.clone();
+                    let m = self.msgs.iter_mut().find(|m| s(m, "id") == id).ok_or("unknown message")?;
+                    if s(m, "from") != seat { return Err("author only: not your message".to_string()) }
+                    m["body"] = json!(format!("[deleted by {seat}]"));
+                    m["deleted"] = json!(true);
+                    if let Some(o) = m.as_object_mut() { o.remove("file"); o.remove("reactions"); }
+                    self.uploads.retain(|u| s(u, "id") != id);
+                    Ok(json!({"ok":true}))
+                })(),
+                "thread_close" | "thread_reopen" | "thread_forget" => (|| {
+                    let n = s(a, "name").to_string();
+                    let exists = self.msgs.iter().any(|m| m["channel"]["kind"] == "topic" && s(&m["channel"], "name") == n);
+                    if !exists { return Err(format!("unknown topic {n}")) }
+                    match name {
+                        "thread_close" => { if !self.closed.contains(&n) { self.closed.push(n) } }
+                        "thread_reopen" => self.closed.retain(|x| *x != n),
+                        _ => { self.closed.retain(|x| *x != n); self.msgs.retain(|m| !(m["channel"]["kind"] == "topic" && s(&m["channel"], "name") == n)) }
+                    }
+                    Ok(json!({"ok":true}))
+                })(),
+                "remove_file" => (|| {
+                    let id = s(a, "id").to_string();
+                    let seat = self.seat.clone();
+                    let m = self.msgs.iter().find(|m| s(m, "id") == id && m.get("file").is_some()).ok_or("unknown share")?;
+                    if s(m, "from") != seat { return Err("sharer only: not your share".to_string()) }
+                    let u = self.uploads.iter_mut().find(|u| s(u, "id") == id).ok_or("unknown share")?;
+                    u["available"] = json!(false);
+                    self.blobs.retain(|(i, _)| *i != id);
+                    Ok(json!({"ok":true}))
+                })(),
+                "mark_read" => {
+                    let ids: Vec<String> = a["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                    self.reads.extend(ids);
+                    Ok(json!({"ok":true}))
                 }
                 "chat_send" => {
                     let body = s(a, "body");
                     if body.trim().is_empty() { return Some(Err("empty body".into())) }
                     let c = a.get("channel").cloned();
                     if let Some(c) = &c { match s(c, "kind") {
-                        "topic" => { let n = s(c, "name"); if n.trim().is_empty() || n.chars().count() > 64 || n != n.trim() { return Some(Err("invalid topic name".into())) } }
+                        "topic" => { let n = s(c, "name"); if self.closed.iter().any(|x| x == n) { return Some(Err("topic is closed".into())) }
+                            if n.trim().is_empty() || n.chars().count() > 64 || n != n.trim() { return Some(Err("invalid topic name".into())) } }
                         "patch" => { if !c["id"].as_u64().is_some_and(|i| self.props.iter().any(|p| p["id"] == i)) { return Some(Err("unknown proposal channel".into())) } }
                         "group" => {}
                         k => return Some(Err(format!("unknown channel kind {k}"))),
@@ -343,6 +398,28 @@ mod sim_t {
         assert_eq!(r["channel"]["kind"], "patch");
     }
 
+    #[test]
+    fn ensure_ok_mismatch_oversize() {
+        use crate::{fetch::ensure, model::FileMeta};
+        use std::time::Duration;
+        let mut sim = Sim::new("me");
+        let good = sim.say_file("bob", "a.png", "image", b"hello bytes", None);
+        let bad = sim.say_file("bob", "b.png", "image", b"hello bytes", Some(&"0".repeat(64)));
+        let (h, _st) = sim.into_handler(None);
+        let mock = super::start("t", h);
+        let m = crate::mcp::Mcp::with(mock.url.clone(), mock.token.clone());
+        let dir = std::env::temp_dir().join(format!("molt-ens-{}", std::process::id()));
+        let meta = |n: u64, c: String| FileMeta { name: "x".into(), kind: "image".into(), size: n, checksum: c };
+        let ok = ensure(&m, &dir, &good, &meta(11, crate::files::sha256_hex(b"hello bytes")), 1000, Duration::from_secs(3)).unwrap();
+        assert_eq!(std::fs::read(ok).unwrap(), b"hello bytes");
+        assert_eq!(mock.called("download_file").len(), 1);
+        assert!(ensure(&m, &dir, &bad, &meta(11, "0".repeat(64)), 1000, Duration::from_secs(3)).unwrap_err().contains("Prüfsumme"));
+        assert!(!dir.join(&bad).exists());
+        assert!(ensure(&m, &dir, &good, &meta(11, String::new()), 1000, Duration::from_secs(1)).is_ok(), "cached file still verifies");
+        assert_eq!(mock.called("download_file").len(), 2, "cache hit makes no call");
+        assert!(ensure(&m, &dir, &good, &meta(11, String::new()), 5, Duration::from_secs(1)).unwrap_err().contains("zu groß"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn list_pages_like_moltd() {
         let mut m = Sim::new("me");

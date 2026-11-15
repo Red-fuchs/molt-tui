@@ -29,7 +29,11 @@ impl Chan {
 pub struct Msg {
     pub id: String, pub from: String, pub ts: i64, pub body: String, pub chan: Chan,
     pub quote: Option<String>, pub reactions: Vec<(String, usize)>,
+    /// emoji -> reacting members (for "did I react" and the toggle state)
+    pub reactors: Vec<(String, Vec<String>)>,
     pub kind: String, pub file: Option<FileMeta>,
+    /// tombstone left by delete_chat (field `deleted` true, or kind "deleted"); the body is then the daemon's deletion notice
+    pub deleted: bool,
 }
 
 /// File share attached to a chat message (the key material the daemon sends is deliberately dropped).
@@ -47,7 +51,7 @@ pub struct Upload {
 }
 
 #[derive(Clone, Debug)]
-pub struct ChanInfo { pub chan: Chan, pub count: u64, pub unread: u64, pub last_ts: i64, pub state: Option<String> }
+pub struct ChanInfo { pub chan: Chan, pub count: u64, pub unread: u64, pub last_ts: i64, pub state: Option<String>, pub closed: bool }
 
 #[derive(Clone, Debug, Default)]
 pub struct Prop {
@@ -101,7 +105,10 @@ pub fn parse_chat(v: &Value) -> (Vec<Msg>, Vec<ChanInfo>, u64) {
         quote: m.get("quote").or(m.get("quoted")).and_then(Value::as_str).map(str::to_string),
         reactions: m.get("reactions").and_then(Value::as_object).into_iter().flatten()
             .map(|(k, v)| (one(k), v.as_array().map_or(0, Vec::len))).collect(),
+        reactors: m.get("reactions").and_then(Value::as_object).into_iter().flatten()
+            .map(|(k, v)| (one(k), v.as_array().into_iter().flatten().filter_map(Value::as_str).map(one).collect())).collect(),
         kind: s(m, "kind"),
+        deleted: m.get("deleted").and_then(Value::as_bool) == Some(true) || s(m, "kind") == "deleted",
         file: m.get("file").filter(|f| f.is_object()).map(|f| FileMeta {
             name: s(f, "name"), kind: s(f, "kind"), size: u(f, "size"), checksum: s(f, "checksum").to_lowercase() }),
     }).collect();
@@ -109,8 +116,14 @@ pub fn parse_chat(v: &Value) -> (Vec<Msg>, Vec<ChanInfo>, u64) {
         chan: c.get("channel").map(Chan::from_json).unwrap_or(Chan::Group),
         count: u(c, "count"), unread: u(c, "unread"), last_ts: c.get("last_ts").and_then(Value::as_i64).unwrap_or(0),
         state: c.get("state").and_then(Value::as_str).map(one),
+        closed: c.get("closed").and_then(Value::as_bool) == Some(true),
     }).collect();
     (msgs, chans, u(v, "wiki_rev"))
+}
+
+impl Msg {
+    /// Emojis this member currently has on the message.
+    pub fn reacted(&self, who: &str) -> Vec<&str> { self.reactors.iter().filter(|(_, v)| v.iter().any(|x| x == who)).map(|(e, _)| e.as_str()).collect() }
 }
 
 pub fn parse_members(v: &Value) -> Vec<Member> {

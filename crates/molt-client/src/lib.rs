@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod compose;
 pub mod mcp;
 pub mod mention;
@@ -6,3 +7,5 @@ pub mod poke;
 pub mod mock;
 pub mod model;
 pub mod text;
+pub mod fetch;
+pub mod files;

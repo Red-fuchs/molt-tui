@@ -1,6 +1,7 @@
 use crate::editor::{Editor, Mv};
 use crate::model::*;
 use crate::text::{clean, one};
+use molt_client::chat;
 use molt_client::compose::{self, Kind, Plan};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -17,12 +18,12 @@ pub enum View { Chat, Props, Wiki }
 pub enum Focus { Side, Main, Input }
 pub enum Hit { Tab(View), Chan(usize), Msg(String), Prop(usize), Doc(usize), Input }
 #[derive(Clone, Debug)]
-pub enum Tag { Send, Vote(u64, bool), Withdraw(u64), Propose, Check, MarkRead, Detail(u64), Doc(String) }
+pub enum Tag { Send, Vote(u64, bool), Withdraw(u64), Propose, Check, MarkRead, Detail(u64), Doc(String), Done(&'static str) }
 pub struct Req { pub tag: Tag, pub name: &'static str, pub args: Value }
-pub enum Ev { Snap(Result<Snap, String>), Reply(Tag, Result<Value, String>) }
+pub enum Ev { Snap(Result<Snap, String>), Reply(Tag, Result<Value, String>), Img(String, crate::imgs::Decoded) }
 /// @mention popup above the input: (name, online) items, selection, char range of the token to replace.
 pub struct Pop { pub items: Vec<(String, bool)>, pub sel: usize, pub range: std::ops::Range<usize> }
-pub enum Modal { Send, Vote(u64, bool), Withdraw(u64), NewTopic(String), Propose(Box<PropForm>) }
+pub enum Modal { React(String), Delete(String), Unshare(String), Thread(chat::Thread, String), Forget(String, String), Send, Vote(u64, bool), Withdraw(u64), NewTopic(String), Propose(Box<PropForm>) }
 
 /// Proposal editor: type picker (field 0), one-line field (1), multi-line field (2); `plan` set = preview stage awaiting J.
 pub struct PropForm { pub kind: usize, pub field: usize, pub a: String, pub b: Editor, pub err: String, pub plan: Option<Plan>, pub warns: Vec<compose::Warning> }
@@ -48,7 +49,7 @@ pub struct App {
     pub wsel: usize, pub wscroll: usize, pub docs: HashMap<String, String>,
     pub toast: Option<(String, bool, Instant)>, pub off: i64,
     pub hits: Vec<(Rect, Hit)>, pub main_rect: Rect, pub in_rect: Rect, pub in_top: usize, pub in_w: usize,
-    pub tx: Option<Sender<Req>>, pub nudge: Option<Sender<()>>, pub sending: bool, pub quit: bool,
+    pub imgs: crate::imgs::Imgs, pub tx: Option<Sender<Req>>, pub nudge: Option<Sender<()>>, pub sending: bool, pub quit: bool,
 }
 
 pub fn pbcopy(s: &str) -> bool {
@@ -72,7 +73,7 @@ impl App {
             modal: None, help: false, psel: 0, pscroll: 0, details: HashMap::new(), pending: HashSet::new(),
             wsel: 0, wscroll: 0, docs: HashMap::new(), toast: None, off,
             hits: vec![], main_rect: Rect::default(), in_rect: Rect::default(), in_top: 0, in_w: 40,
-            tx: None, nudge: None, sending: false, quit: false,
+            imgs: crate::imgs::Imgs::new(), tx: None, nudge: None, sending: false, quit: false,
         }
     }
 
@@ -109,6 +110,7 @@ impl App {
                 self.pending.clear();
                 self.rebuild();
             }
+            Ev::Img(id, r) => self.imgs.on_loaded(id, r),
             Ev::Snap(Err(e)) => { self.fails += 1; self.err = Some(one(&e)) }
             Ev::Reply(tag, r) => match (tag, r) {
                 (Tag::Send, Ok(v)) => {
@@ -145,6 +147,8 @@ impl App {
                     let head = if molt_client::mcp::is_unknown(&e) { "Vorschlag" } else { "Vorschlag abgelehnt:" };
                     self.toast(format!("{head} {}", one(&e)), true);
                 }
+                (Tag::Done(l), Ok(_)) => { self.toast(l, false); self.poke() }
+                (Tag::Done(l), Err(e)) => self.toast(format!("{l}: fehlgeschlagen: {}", one(&e)), true),
                 (Tag::MarkRead, Ok(_)) => { self.toast("Als gelesen markiert", false); self.poke() }
                 (Tag::MarkRead, Err(e)) => self.toast(format!("Fehler: {}", one(&e)), true),
                 (Tag::Detail(id), Ok(v)) => { self.details.insert(id, parse_prop(&v)); }
@@ -159,6 +163,14 @@ impl App {
 
     /// Issue on-demand fetches for what the current view needs.
     pub fn pump(&mut self) {
+        if self.tab == View::Chat && self.imgs.enabled() {
+            let snap = std::mem::take(&mut self.snap.msgs);
+            let v: Vec<&Msg> = { let mut v: Vec<&Msg> = snap.iter().filter(|m| m.chan == self.cur).collect(); v.sort_by_key(|m| m.ts); v };
+            self.imgs.want(&v);
+            self.imgs.sync_viewer(&v);
+            drop(v);
+            self.snap.msgs = snap;
+        }
         match self.tab {
             View::Props => {
                 let id = self.sorted_props().get(self.psel).map(|p| p.id);
@@ -206,6 +218,24 @@ impl App {
     fn mark_read(&mut self) {
         let a = self.cur.to_json().map_or(json!({}), |c| json!({"channel": c}));
         self.req(Tag::MarkRead, "mark_channel_read", a);
+    }
+    /// Selected message, only if it is ours: seat author AND our sender tag (the seat is shared with other humans/AIs).
+    fn own_sel(&self) -> Option<&Msg> {
+        let id = self.sel.as_ref()?;
+        let m = self.snap.msgs.iter().find(|m| &m.id == id)?;
+        let tag = sender_id();
+        let ok = molt_client::chat::is_own(m, self.me()) && (tag == "-" || split_tag(&m.body).0 == Some(tag.as_str()));
+        ok.then_some(m)
+    }
+    fn react(&mut self, id: String, i: usize) {
+        if let Some(e) = chat::REACTIONS.get(i) { self.req(Tag::Done("Reaktion gesendet"), "react_chat", json!({"id":id,"emoji":e})) }
+    }
+    fn cur_topic(&self) -> Option<String> { if let Chan::Topic(n) = &self.cur { Some(n.clone()) } else { None } }
+    fn mark_sel_read(&mut self) {
+        match self.sel.clone().filter(|i| chat::valid_id(i)) {
+            Some(id) => self.req(Tag::Done("Nachricht als gelesen markiert"), "mark_read", json!({"ids":[id]})),
+            None => self.toast("Erst eine Nachricht wählen", true),
+        }
     }
     fn vote(&mut self, id: u64, approve: bool) {
         self.req(Tag::Vote(id, approve), if approve { "approve" } else { "decline" }, json!({"proposal_id": id}));
@@ -258,6 +288,37 @@ impl App {
                 Char('a' | 'A') => { self.confirm = false; self.toast("Rückfrage vor dem Senden aus (F6)", false); self.do_send(); None }
                 Esc | Char('n' | 'N') => None,
                 _ => Some(Modal::Send),
+            },
+            Modal::React(id) => match k.code {
+                Char(c @ '1'..='6') => { self.react(id, c as usize - '1' as usize); None }
+                Esc => None,
+                _ => Some(Modal::React(id)),
+            },
+            Modal::Delete(id) => match k.code {
+                Char('j' | 'J' | 'y' | 'Y') => { self.req(Tag::Done("Nachricht gelöscht"), "delete_chat", json!({"id":id})); None }
+                Esc | Char('n' | 'N') => None,
+                _ => Some(Modal::Delete(id)),
+            },
+            Modal::Unshare(id) => match k.code {
+                Char('j' | 'J' | 'y' | 'Y') => { self.req(Tag::Done("Freigabe zurückgezogen"), "remove_file", json!({"id":id})); None }
+                Esc | Char('n' | 'N') => None,
+                _ => Some(Modal::Unshare(id)),
+            },
+            Modal::Thread(op, n) => match k.code {
+                Char('j' | 'J' | 'y' | 'Y') => { self.req(Tag::Done(if op == chat::Thread::Close { "Thema geschlossen" } else { "Thema wieder geöffnet" }), op.tool(), json!({"name":n})); None }
+                Esc | Char('n' | 'N') => None,
+                _ => Some(Modal::Thread(op, n)),
+            },
+            Modal::Forget(n, mut t) => match k.code {
+                Esc => None,
+                Enter if t == n => {
+                    if self.cur == Chan::Topic(n.clone()) { self.select_chan(Chan::Group) }
+                    self.req(Tag::Done("Thema auf diesem Sitz vergessen"), "thread_forget", json!({"name":n})); None
+                }
+                Enter => { self.toast("Name stimmt nicht überein", true); Some(Modal::Forget(n, t)) }
+                Backspace => { t.pop(); Some(Modal::Forget(n, t)) }
+                Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => { t.push(c); Some(Modal::Forget(n, t)) }
+                _ => Some(Modal::Forget(n, t)),
             },
             Modal::Vote(id, a) => match k.code {
                 Char('j' | 'J' | 'y' | 'Y') => { self.vote(id, a); None }
@@ -361,6 +422,7 @@ impl App {
         use KeyCode::*;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == Char('c') { self.quit = true; return }
+        if self.imgs.viewer.is_some() { self.viewer_key(k); return }
         if let Some(m) = self.modal.take() { self.modal = self.modal_key(m, k); return }
         if self.help {
             if matches!(k.code, Esc | F(1) | Char('?' | 'q')) { self.help = false }
@@ -374,6 +436,7 @@ impl App {
             F(4) => { self.set_tab(View::Props); return }
             F(5) => { self.set_tab(View::Wiki); return }
             F(6) => { self.confirm = !self.confirm; self.toast(if self.confirm { "Rückfrage vor dem Senden: an" } else { "Rückfrage vor dem Senden: aus" }, false); return }
+            F(7) => { self.imgs.on = !self.imgs.on; self.toast(if !self.imgs.enabled() { "Bilder nicht verfügbar (kein Terminal oder MOLT_IMAGES=off)" } else if self.imgs.on { "Bilder: an" } else { "Bilder: aus" }, false); return }
             Tab => { self.cycle(true); return }
             BackTab => { self.cycle(false); return }
             Char('n') if ctrl => { self.modal = Some(Modal::NewTopic(String::new())); return }
@@ -477,7 +540,8 @@ impl App {
             End => e.mv(if ctrl { Mv::Bottom } else { Mv::End }, shift, w),
             PageUp => self.scroll += 10,
             PageDown => self.scroll = self.scroll.saturating_sub(10),
-            Char(c) if !ctrl && !alt => e.insert_str(&c.to_string()),
+            // German Mac: @ { } [ ] | ~ \\ are Option+key; the terminal reports the char with ALT, so only alt+letter/digit are shortcuts
+            Char(c) if !ctrl && (!alt || !c.is_alphanumeric()) => e.insert_str(&c.to_string()),
             _ => {}
         }
     }
@@ -491,6 +555,7 @@ impl App {
             PageDown => self.scroll = self.scroll.saturating_sub(10),
             End | Char('G') => { self.scroll = 0; self.sel = None }
             Home | Char('g') => self.scroll = usize::MAX / 2,
+            Char('o') | Enter if self.open_viewer() => {}
             Char('r') | Enter => {
                 if self.sel.is_some() { self.quote = self.sel.clone() }
                 self.focus = Focus::Input;
@@ -498,10 +563,32 @@ impl App {
             Char('c') => if let Some((_, b)) = self.sel_msg_text() { self.copy(&b) },
             Char('C') => if let Some((f, b)) = self.sel_msg_text() { self.copy(&format!("{f}: {b}")) },
             Char('m') => self.mark_read(),
+            Char('M') => self.mark_sel_read(),
+            Char('e') => match self.sel.clone().filter(|i| chat::valid_id(i)) { Some(id) => self.modal = Some(Modal::React(id)), None => self.toast("Erst eine Nachricht wählen", true) },
+            Char('x') => match self.own_sel().map(|m| m.id.clone()) { Some(id) => self.modal = Some(Modal::Delete(id)), None => self.toast("Nur eigene (mit deinem Absender-Tag), nicht gelöschte Nachrichten lassen sich löschen", true) },
+            Char('u') => match self.own_sel().filter(|m| m.file.is_some()).map(|m| m.id.clone()) { Some(id) => self.modal = Some(Modal::Unshare(id)), None => self.toast("Nur eigene Dateifreigaben lassen sich zurückziehen", true) },
             Char('i') => self.focus = Focus::Input,
             Esc => self.sel = None,
             _ => {}
         }
+    }
+
+    /// Open the full-screen viewer on the selected image message (only if it is loaded).
+    fn open_viewer(&mut self) -> bool {
+        let Some(id) = self.sel.clone() else { return false };
+        let msgs = self.msgs();
+        if !msgs.iter().any(|m| m.id == id && crate::imgs::is_img(m)) { return false }
+        if !self.imgs.on || !self.imgs.has(&id) { return false }
+        let ids = msgs.iter().filter(|m| crate::imgs::is_img(m)).map(|m| m.id.clone()).collect();
+        self.imgs.viewer = crate::viewer::Viewer::new(ids, &id);
+        self.imgs.viewer.is_some()
+    }
+    fn viewer_key(&mut self, k: KeyEvent) {
+        use crate::viewer::{VAct, VKey};
+        use KeyCode::*;
+        let vk = match k.code { Esc | Char('q') | Char('o') | Enter => VKey::Esc, Left | Char('h') => VKey::Left, Right | Char('l') => VKey::Right,
+            Home => VKey::Home, End => VKey::End, _ => VKey::Other };
+        if let Some(v) = self.imgs.viewer.as_mut() { if v.step(vk) == VAct::Close { self.imgs.viewer = None } }
     }
 
     fn side_key(&mut self, k: KeyEvent) {
@@ -512,6 +599,10 @@ impl App {
             Enter | Right => self.focus = Focus::Input,
             Char('m') => self.mark_read(),
             Char('n') => self.modal = Some(Modal::NewTopic(String::new())),
+            Char(c @ ('x' | 'o' | 'F')) => match self.cur_topic() {
+                Some(n) => self.modal = Some(match c { 'x' => Modal::Thread(chat::Thread::Close, n), 'o' => Modal::Thread(chat::Thread::Reopen, n), _ => Modal::Forget(n, String::new()) }),
+                None => self.toast("Nur für Themen-Kanäle", true),
+            },
             _ => {}
         }
     }
@@ -559,6 +650,7 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.imgs.viewer.is_some() { return }
         let (x, y) = (m.column, m.row);
         let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
         if self.modal.is_some() || self.help { return }
@@ -617,6 +709,59 @@ mod t {
         a.tx = Some(tx);
         a.on_ev(Ev::Snap(Ok(crate::model::fixtures::snap())));
         (a, rx)
+    }
+    #[test]
+    fn react_delete_threads_confirm_flows() {
+        let (mut a, rx) = app();
+        a.focus = Focus::Main;
+        a.sel = Some("a1".into()); // fixture ids are not 32-hex: refused locally
+        a.on_key(key(KeyCode::Char('e')));
+        assert!(a.modal.is_none() && rx.try_recv().is_err());
+        let id = "b".repeat(32);
+        for m in a.snap.msgs.iter_mut() { if m.id == "a2" { m.id = id.clone(); m.body = tag_body(&m.body, &sender_id()) } else if m.id == "a1" { m.id = "c".repeat(32) } }
+        a.sel = Some(id.clone());
+        a.on_key(key(KeyCode::Char('e')));
+        assert!(matches!(a.modal, Some(Modal::React(_))));
+        a.on_key(key(KeyCode::Char('9')));
+        assert!(rx.try_recv().is_err());
+        a.on_key(key(KeyCode::Char('2')));
+        let r = rx.try_recv().unwrap();
+        assert_eq!((r.name, r.args["emoji"].clone()), ("react_chat", json!("❤️")));
+        // delete: needs J
+        a.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(a.modal, Some(Modal::Delete(_))));
+        a.on_key(key(KeyCode::Char('n')));
+        assert!(rx.try_recv().is_err());
+        a.on_key(key(KeyCode::Char('x'))); a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(rx.try_recv().unwrap().name, "delete_chat");
+        // foreign message: refused, no modal
+        a.sel = Some("c".repeat(32));
+        a.on_key(key(KeyCode::Char('x')));
+        assert!(a.modal.is_none() && rx.try_recv().is_err());
+        // same author name but foreign tag: refused (shared seat)
+        a.sel = Some(id.clone());
+        for m in a.snap.msgs.iter_mut() { if m.id == id { m.body = "[Anderer] x".into() } }
+        if sender_id() != "-" { a.on_key(key(KeyCode::Char('x'))); assert!(a.modal.is_none()) }
+        // threads
+        a.select_chan(Chan::Topic("Ideen".into()));
+        a.focus = Focus::Side;
+        a.on_key(key(KeyCode::Char('x')));
+        assert!(matches!(a.modal, Some(Modal::Thread(chat::Thread::Close, _))) && rx.try_recv().is_err());
+        a.on_key(key(KeyCode::Char('j')));
+        assert_eq!(rx.try_recv().unwrap().name, "thread_close");
+        a.on_key(key(KeyCode::Char('F')));
+        for c in "Idee".chars() { a.on_key(key(KeyCode::Char(c))) }
+        a.on_key(key(KeyCode::Enter));
+        assert!(rx.try_recv().is_err() && a.modal.is_some(), "wrong name must not forget");
+        for c in "n".chars() { a.on_key(key(KeyCode::Char(c))) }
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(rx.try_recv().unwrap().name, "thread_forget");
+        assert_eq!(a.cur, Chan::Group);
+        // mark_read only on explicit key, only the selected id
+        a.focus = Focus::Main; a.sel = Some(id.clone());
+        a.on_key(key(KeyCode::Char('M')));
+        let r = rx.try_recv().unwrap();
+        assert_eq!((r.name, r.args["ids"].clone()), ("mark_read", json!([id])));
     }
     #[test]
     fn mention_popup_accept_and_esc() {
@@ -717,6 +862,13 @@ mod t {
         a.on_key(key(KeyCode::Char('r')));
         assert_eq!(a.quote.as_deref(), Some("a1"));
         assert_eq!(a.focus, Focus::Input);
+    }
+    #[test]
+    fn option_chars_are_typed() {
+        let (mut a, _rx) = app();
+        a.focus = Focus::Input;
+        for c in ['@', '{', '}', '[', '|'] { a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)) }
+        assert_eq!(a.ed.text(), "@{}[|");
     }
     fn ctrl(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL) }
     fn typ(a: &mut App, s: &str) { for c in s.chars() { a.on_key(key(KeyCode::Char(c))) } }
