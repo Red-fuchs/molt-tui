@@ -37,7 +37,7 @@ pub struct Msg {
 pub struct FileMeta { pub name: String, pub kind: String, pub size: u64, pub checksum: String }
 
 #[derive(Clone, Debug, Default)]
-pub struct Member { pub name: String, pub desc: String, pub image: String, pub presence: u64, pub last_seen: i64, pub uploads: u64 }
+pub struct Member { pub name: String, pub desc: String, pub image: String, pub presence: u64, pub last_seen: i64, pub uploads: u64, pub pending: u64 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Upload {
@@ -74,6 +74,8 @@ pub struct Status {
 pub struct Snap {
     pub st: Status, pub msgs: Vec<Msg>, pub chans: Vec<ChanInfo>, pub props: Vec<Prop>,
     pub acts: Vec<Act>, pub docs: Vec<Doc>, pub wiki_rev: u64,
+    /// read_members (for @mention completion/extraction) and the node's poke_enabled setting; both tolerant (empty/false on error).
+    pub roster: Vec<Member>, pub poke_enabled: bool,
 }
 
 fn s(v: &Value, k: &str) -> String { one(v.get(k).and_then(Value::as_str).unwrap_or("")) }
@@ -115,7 +117,7 @@ pub fn parse_members(v: &Value) -> Vec<Member> {
     arr(v, "members").map(|m| Member {
         name: s(m, "member"), desc: one(m.get("description").and_then(Value::as_str).unwrap_or("")),
         image: m.get("image").and_then(Value::as_str).unwrap_or("").trim().to_string(),
-        presence: u(m, "presence"), last_seen: m.get("last_seen").and_then(Value::as_i64).unwrap_or(0), uploads: u(m, "uploads"),
+        presence: u(m, "presence"), last_seen: m.get("last_seen").and_then(Value::as_i64).unwrap_or(0), uploads: u(m, "uploads"), pending: u(m, "open_proposals"),
     }).collect()
 }
 
@@ -187,7 +189,7 @@ pub fn parse_snap(st: &Value, chat: &Value, props: &Value, acts: &Value, wiki: &
         props: arr(props, "proposals").map(parse_prop).collect(),
         acts: arr(acts, "actions").map(|a| Act { kind: s(a, "kind"), proposal: a.get("proposal").and_then(Value::as_u64) }).collect(),
         docs: arr(wiki, "docs").map(|d| Doc { path: s(d, "path"), title: s(d, "title"), bytes: u(d, "bytes") }).collect(),
-        wiki_rev,
+        wiki_rev, roster: vec![], poke_enabled: false,
     }
 }
 
@@ -215,7 +217,10 @@ pub fn fetch_snap(m: &Mcp) -> Result<Snap, String> {
     let props = fetch_proposals(m)?;
     let acts = m.call("read_actions", json!({}))?;
     let wiki = m.call("wiki_list", json!({"limit":500}))?;
-    Ok(parse_snap(&st, &chat, &props, &acts, &wiki))
+    let mut snap = parse_snap(&st, &chat, &props, &acts, &wiki);
+    snap.roster = m.call("read_members", json!({})).map(|v| parse_members(&v)).unwrap_or_default();
+    snap.poke_enabled = crate::poke::poke_enabled(m);
+    Ok(snap)
 }
 
 #[derive(Clone, Debug)]
@@ -283,7 +288,10 @@ pub mod fixtures {
              "votes":[{"member":"bob","vote":"approved"},{"member":"alice","vote":"open"},{"member":"carol","vote":"declined"}]}]});
         let acts = json!({"actions":[{"kind":"vote","proposal":4}]});
         let wiki = json!({"docs":[{"path":"home.md","title":"Startseite","bytes":1055},{"path":"themen/index.md","title":"Themenübersicht","bytes":915}]});
-        parse_snap(&st, &chat, &props, &acts, &wiki)
+        let mut s = parse_snap(&st, &chat, &props, &acts, &wiki);
+        s.roster = ["bob", "alice", "carol"].iter().map(|n| Member { name: n.to_string(), presence: 1, ..Default::default() }).collect();
+        s.poke_enabled = true;
+        s
     }
 }
 

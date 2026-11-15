@@ -22,6 +22,18 @@ fn restore() {
 
 fn arg(args: &[String], k: &str) -> Option<String> { args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned()) }
 
+/// chat_send, then fire-and-forget pokes for @mentions (args carry the roster in "@poke"; it is stripped before the call).
+fn send_poking(w: &Mcp, gate: &mut molt_client::poke::PokeGate, mut a: serde_json::Value) -> Result<serde_json::Value, String> {
+    use molt_client::{model::Member, poke};
+    let ctx = a.as_object_mut().and_then(|o| o.remove("@poke")).unwrap_or_default();
+    let roster: Vec<Member> = ctx["roster"].as_array().into_iter().flatten()
+        .map(|r| Member { name: r[0].as_str().unwrap_or("").into(), presence: r[1].as_u64().unwrap_or(0), ..Default::default() }).collect();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let o = poke::send_with_pokes(w, gate, &roster, ctx["me"].as_str().unwrap_or(""), ctx["enabled"].as_bool() == Some(true), false, a, now);
+    let txt = poke::summary_de(&o);
+    o.sent.map(|mut v| { if let (Some(t), Some(m)) = (txt, v.as_object_mut()) { m.insert("@pokes".into(), t.into()); } v })
+}
+
 fn dump(args: &[String]) -> i32 {
     let m = match Mcp::new() { Ok(m) => m, Err(e) => { eprintln!("molt-tui: {e}"); return 2 } };
     let snap = match model::fetch_snap(&m) { Ok(s) => s, Err(e) => { eprintln!("molt-tui: moltd nicht erreichbar: {e} (läuft moltd mit [mcp]-Token? prüfe MOLT_URL)"); return 2 } };
@@ -78,8 +90,11 @@ fn main() {
         let _ = nrx.recv_timeout(Duration::from_secs(3));
         while nrx.try_recv().is_ok() {}
     });
+    let mut gate = molt_client::poke::PokeGate::default();
     std::thread::spawn(move || for r in rrx {
-        let res = if r.name == "@check" {
+        let res = if r.name == "chat_send" && r.args.get("@poke").is_some() {
+            send_poking(&worker, &mut gate, r.args)
+        } else if r.name == "@check" {
             let plan = molt_client::compose::Plan { tool: "wiki_edit", args: r.args, preview: String::new() };
             molt_client::compose::check(&worker, plan).map(|c| serde_json::json!({"args":c.plan.args,"warnings":c.warnings.iter().map(|w| serde_json::json!({"code":w.code,"text":w.text})).collect::<Vec<_>>()}))
         } else { worker.call(r.name, r.args) };

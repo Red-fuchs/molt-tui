@@ -20,6 +20,8 @@ pub enum Hit { Tab(View), Chan(usize), Msg(String), Prop(usize), Doc(usize), Inp
 pub enum Tag { Send, Vote(u64, bool), Withdraw(u64), Propose, Check, MarkRead, Detail(u64), Doc(String) }
 pub struct Req { pub tag: Tag, pub name: &'static str, pub args: Value }
 pub enum Ev { Snap(Result<Snap, String>), Reply(Tag, Result<Value, String>) }
+/// @mention popup above the input: (name, online) items, selection, char range of the token to replace.
+pub struct Pop { pub items: Vec<(String, bool)>, pub sel: usize, pub range: std::ops::Range<usize> }
 pub enum Modal { Send, Vote(u64, bool), Withdraw(u64), NewTopic(String), Propose(Box<PropForm>) }
 
 /// Proposal editor: type picker (field 0), one-line field (1), multi-line field (2); `plan` set = preview stage awaiting J.
@@ -35,6 +37,7 @@ impl PropForm {
 
 pub struct App {
     pub draft: Option<Box<PropForm>>,
+    pub pop: Option<Pop>, pub pop_off: Option<usize>,
     pub snap: Snap, pub loaded: bool, pub err: Option<String>, pub fails: u32,
     pub tab: View, pub focus: Focus,
     pub entries: Vec<Entry>, pub cur: Chan, pub extra: Vec<String>,
@@ -63,7 +66,7 @@ pub use molt_client::model::{sender_id, tag_body};
 impl App {
     pub fn new(off: i64) -> App {
         App {
-            draft: None, snap: Snap::default(), loaded: false, err: None, fails: 0, tab: View::Chat, focus: Focus::Input,
+            draft: None, pop: None, pop_off: None, snap: Snap::default(), loaded: false, err: None, fails: 0, tab: View::Chat, focus: Focus::Input,
             entries: vec![], cur: Chan::Group, extra: vec![], sel: None, scroll: 0, reveal: false, last_total: 0,
             ed: Editor::default(), quote: None, confirm: true, mouse: true, mouse_dirty: false,
             modal: None, help: false, psel: 0, pscroll: 0, details: HashMap::new(), pending: HashSet::new(),
@@ -108,9 +111,10 @@ impl App {
             }
             Ev::Snap(Err(e)) => { self.fails += 1; self.err = Some(one(&e)) }
             Ev::Reply(tag, r) => match (tag, r) {
-                (Tag::Send, Ok(_)) => {
+                (Tag::Send, Ok(v)) => {
                     self.sending = false; self.ed.clear(); self.quote = None; self.scroll = 0; self.sel = None;
-                    self.toast("Gesendet", false); self.poke();
+                    let extra = v.get("@pokes").and_then(Value::as_str).map(|t| format!(" · {t}")).unwrap_or_default();
+                    self.toast(format!("Gesendet{extra}"), false); self.poke();
                 }
                 (Tag::Send, Err(e)) => { self.sending = false; self.toast(format!("Senden fehlgeschlagen: {}", one(&e)), true) }
                 (Tag::Vote(id, a), Ok(_)) => {
@@ -194,6 +198,8 @@ impl App {
         let mut a = json!({"body": tag_body(self.ed.text().trim_end(), &sender_id())});
         if let Some(c) = self.cur.to_json() { a["channel"] = c }
         if let Some(q) = &self.quote { a["quote"] = json!(q) }
+        let ro: Vec<Value> = self.snap.roster.iter().map(|m| json!([m.name, m.presence])).collect();
+        a["@poke"] = json!({"me": self.me(), "enabled": self.snap.poke_enabled, "roster": ro});
         self.sending = true;
         self.req(Tag::Send, "chat_send", a);
     }
@@ -401,6 +407,40 @@ impl App {
         use KeyCode::*;
         let m = k.modifiers;
         let (ctrl, alt, shift) = (m.contains(KeyModifiers::CONTROL), m.contains(KeyModifiers::ALT), m.contains(KeyModifiers::SHIFT));
+        if self.pop.is_some() && !ctrl && !alt {
+            match k.code {
+                Up => { if let Some(p) = &mut self.pop { p.sel = (p.sel + p.items.len() - 1) % p.items.len() } return }
+                Down => { if let Some(p) = &mut self.pop { p.sel = (p.sel + 1) % p.items.len() } return }
+                Tab | Enter if !shift => { self.accept_mention(); return }
+                Esc => { self.pop_off = self.pop.take().map(|p| p.range.start); return }
+                _ => {}
+            }
+        }
+        self.input_edit(k);
+        self.update_pop();
+    }
+
+    /// Recompute the @mention popup from the editor text/cursor.
+    pub fn update_pop(&mut self) {
+        let tok = if self.tab == View::Chat && self.focus == Focus::Input { molt_client::mention::token_at(&self.ed.text(), self.ed.cur) } else { None };
+        let Some((range, q)) = tok else { self.pop = None; self.pop_off = None; return };
+        if self.pop_off == Some(range.start) { self.pop = None; return }
+        let items: Vec<(String, bool)> = molt_client::mention::complete(&q, &self.snap.roster, self.me()).into_iter().take(8).map(|m| (m.name.clone(), m.presence > 0)).collect();
+        let sel = self.pop.as_ref().map_or(0, |p| p.sel).min(items.len().saturating_sub(1));
+        self.pop = if items.is_empty() { None } else { Some(Pop { items, sel, range }) };
+    }
+    fn accept_mention(&mut self) {
+        let Some(p) = self.pop.take() else { return };
+        let (t, cur) = molt_client::mention::insert(&self.ed.text(), p.range.clone(), &p.items[p.sel].0);
+        let ins: String = t.chars().skip(p.range.start).take(cur - p.range.start).collect();
+        self.ed.replace(p.range, &ins);
+        self.pop_off = None;
+    }
+
+    fn input_edit(&mut self, k: KeyEvent) {
+        use KeyCode::*;
+        let m = k.modifiers;
+        let (ctrl, alt, shift) = (m.contains(KeyModifiers::CONTROL), m.contains(KeyModifiers::ALT), m.contains(KeyModifiers::SHIFT));
         let w = self.in_w;
         let e = &mut self.ed;
         match k.code {
@@ -577,6 +617,28 @@ mod t {
         a.tx = Some(tx);
         a.on_ev(Ev::Snap(Ok(crate::model::fixtures::snap())));
         (a, rx)
+    }
+    #[test]
+    fn mention_popup_accept_and_esc() {
+        let (mut a, rx) = app();
+        a.confirm = false;
+        for c in "hi @bo".chars() { a.on_key(key(KeyCode::Char(c))) }
+        assert_eq!(a.pop.as_ref().unwrap().items[0].0, "bob");
+        a.on_key(key(KeyCode::Esc));
+        assert!(a.pop.is_none() && a.focus == Focus::Input);
+        a.on_key(key(KeyCode::Char('b')));
+        assert!(a.pop.is_none(), "stays closed while same token");
+        a.ed.clear();
+        for c in "@c".chars() { a.on_key(key(KeyCode::Char(c))) }
+        assert_eq!(a.pop.as_ref().unwrap().items.len(), 1); // own seat alice excluded, bob has no c
+        a.on_key(key(KeyCode::Enter));
+        assert_eq!(a.ed.text(), "@{carol} ");
+        assert!(rx.try_recv().is_err(), "Enter accepted the mention, did not send");
+        for c in "ok".chars() { a.on_key(key(KeyCode::Char(c))) }
+        a.on_key(key(KeyCode::Enter));
+        let r = rx.try_recv().unwrap();
+        assert_eq!(r.args["@poke"]["me"], "alice");
+        assert!(r.args["body"].as_str().unwrap().ends_with("@{carol} ok"));
     }
     #[test]
     fn sender_tag() {

@@ -65,6 +65,13 @@ impl Editor {
         self.t.splice(self.cur..self.cur, s.chars());
         self.cur += n;
     }
+    /// Replace a char range (used by @mention accept); cursor lands after the new text.
+    pub fn replace(&mut self, r: std::ops::Range<usize>, s: &str) {
+        let (a, b) = (r.start.min(self.t.len()), r.end.min(self.t.len()));
+        self.snap(0);
+        self.t.splice(a..b, s.chars());
+        self.cur = a + s.chars().count(); self.anc = None;
+    }
     pub fn newline(&mut self) { self.snap(0); self.del_sel(); self.t.insert(self.cur, '\n'); self.cur += 1 }
     pub fn backspace(&mut self) {
         if self.sel().is_some() { self.snap(0); self.del_sel(); }

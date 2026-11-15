@@ -238,6 +238,23 @@ fn draw_input(f: &mut Frame, a: &mut App, r: Rect) {
     if focus && a.modal.is_none() && !a.help {
         f.set_cursor_position(Position::new(inner.x + (cc as u16).min(inner.width.saturating_sub(1)), inner.y + (cr - a.in_top) as u16));
     }
+    if let (Some(p), true) = (&a.pop, focus) { draw_pop(f, p, r) }
+}
+
+/// @mention list directly above the input box.
+fn draw_pop(f: &mut Frame, p: &Pop, input: Rect) {
+    let h = (p.items.len() as u16 + 2).min(input.y.max(3));
+    let wd = (p.items.iter().map(|i| tw(&i.0) + 4).max().unwrap_or(10) as u16 + 4).clamp(16, input.width);
+    let r = Rect::new(input.x, input.y.saturating_sub(h), wd, h);
+    f.render_widget(Clear, r);
+    let b = Block::bordered().title(" @ Mitglied (↑↓ Tab/Enter, Esc) ").border_style(Style::new().fg(Color::Cyan));
+    let inner = b.inner(r);
+    f.render_widget(b, r);
+    let lines: Vec<Line> = p.items.iter().enumerate().take(inner.height as usize).map(|(i, (n, on))| {
+        let st = if i == p.sel { Style::new().bg(Color::Blue).fg(Color::White) } else { Style::new() };
+        Line::from(vec![sp(if *on { "● " } else { "○ " }, if *on { st.fg(Color::Green) } else { DIM }), sp(n.clone(), st)])
+    }).collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn prop_lines(a: &App, p: &Prop, wd: usize) -> Vec<Line<'static>> {
@@ -518,6 +535,14 @@ mod t {
         assert!(!s.contains('\x1b') && !s.contains('\u{202e}'));
         assert!(s.contains("↪ bob: Hallo zusammen, ⏎ wie läuft's?"), "{s}");
         assert!(s.contains("❤️"));
+    }
+    #[test]
+    fn mention_popup_renders() {
+        let mut a = app();
+        for c in "@".chars() { a.ed.insert_str(&c.to_string()) }
+        a.update_pop();
+        let s = dump(&mut a, 100, 30);
+        assert!(s.contains("@ Mitglied") && s.contains("● bob") && !s.contains("● alice"), "{s}");
     }
     #[test]
     fn error_banner() {

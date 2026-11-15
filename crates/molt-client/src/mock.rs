@@ -73,7 +73,7 @@ pub mod sim {
 
     pub struct Sim {
         pub seat: String, pub members: Vec<String>, pub threshold: u64, pub msgs: Vec<Value>, pub props: Vec<Value>,
-        pub uploads: Vec<Value>, pub pages: Vec<String>, pub contents: Vec<(String, String)>, pub foreign: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, n: u64, next_prop: u64,
+        pub uploads: Vec<Value>, pub pages: Vec<String>, pub contents: Vec<(String, String)>, pub foreign: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, pub poke_enabled: bool, pub clock: i64, pub pokes: Vec<(String, i64)>, n: u64, next_prop: u64,
     }
 
     fn hex_id(n: u64) -> String { format!("{n:032x}") }
@@ -83,7 +83,7 @@ pub mod sim {
         /// Seat `seat`, members bob + carol, threshold 2; proposal 4 (open, by bob) and 1 (applied) exist.
         pub fn new(seat: &str) -> Sim {
             let mut m = Sim { seat: seat.into(), members: vec!["bob".into(), "carol".into(), seat.into()], threshold: 2, msgs: vec![], props: vec![],
-                uploads: vec![], pages: vec!["home.md".into()], contents: vec![("home.md".into(), "---\ntype: meta\ntitle: Start\n---\n\n# Start\n".into())], foreign: vec!["home.md".into()], blobs: vec![], n: 100, next_prop: 5 };
+                uploads: vec![], pages: vec!["home.md".into()], contents: vec![("home.md".into(), "---\ntype: meta\ntitle: Start\n---\n\n# Start\n".into())], foreign: vec!["home.md".into()], blobs: vec![], poke_enabled: true, clock: 1_000, pokes: vec![], n: 100, next_prop: 5 };
             m.props.push(json!({"id":1,"state":"applied","by":"bob","surface":"memory","payload":{"op":"add_note","title":"Alt"},"approvals":2,"threshold":2,
                 "votes":[{"member":"bob","vote":"approved"},{"member":"carol","vote":"approved"}],"approved_by_me":false,"declined_by_me":false}));
             m.props.push(json!({"id":4,"state":"proposed","by":"bob","surface":"memory","payload":{"op":"wiki_patch","summary":"+1","value":"diff --git a/neu.md b/neu.md\nnew file mode 100644\n--- /dev/null\n+++ b/neu.md\n@@ -0,0 +1 @@\n+Hallo\n"},
@@ -192,7 +192,17 @@ pub mod sim {
         pub fn call(&mut self, name: &str, a: &Value) -> Option<Result<Value, String>> {
             Some(match name {
                 "status" => Ok(json!({"name":"Demo Republic","member":self.seat,"members":self.members,"chat_retention_days":7,"relays":["ws://a"],"features":["memory"]})),
-                "read_members" => Ok(json!({"members":self.members.iter().map(|m| json!({"member":m,"presence":0})).collect::<Vec<_>>()})),
+                "read_members" => Ok(json!({"members":self.members.iter().map(|m| json!({"member":m,"presence":if *m == self.seat {0} else {1},"open_proposals":0})).collect::<Vec<_>>()})),
+                "read_session" => Ok(json!({"settings":{"poke_enabled":self.poke_enabled}})),
+                "poke" => (|| {
+                    let t = s(a, "member").to_string();
+                    if !self.poke_enabled { return Err("poking is disabled (settings poke_enabled)".to_string()) }
+                    if t == self.seat { return Err("cannot poke this seat itself".into()) }
+                    if !self.members.contains(&t) { return Err(format!("unknown member {t}")) }
+                    if self.pokes.iter().any(|(n, ts)| *n == t && self.clock - ts < 60) { return Err("rate limited: one poke per member per minute".into()) }
+                    self.pokes.push((t, self.clock));
+                    Ok(json!({"ok":true}))
+                })(),
                 "read_uploads" => Ok(json!({"uploads":self.uploads})),
                 "download_file" => (|| {
                     let id = s(a, "id");
