@@ -1,5 +1,6 @@
 mod app;
 mod editor;
+mod uistate;
 mod imglay;
 mod imgs;
 mod pixel;
@@ -130,6 +131,7 @@ fn main() {
     let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout())).expect("terminal");
 
     let mut a = App::new(text::tz_offset());
+    if let Some(p) = uistate::default_path() { a.load_ui(p) }
     a.tx = Some(rtx);
     a.nudge = Some(ntx);
     if imode != imgs::Mode::Off { a.imgs.tx = Some(itx) }

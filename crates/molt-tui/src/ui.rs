@@ -119,39 +119,42 @@ fn draw_banner(f: &mut Frame, a: &App, r: Rect) {
     f.render_widget(Paragraph::new(Line::from(sp(format!("{t:<w$}", w = r.width as usize), st))), r);
 }
 
-fn side_rows(a: &App) -> Vec<(Option<usize>, String, bool, u64)> {
-    let mut v = vec![];
-    let mut last = 255;
-    for (i, e) in a.entries.iter().enumerate() {
-        let sec = match e.section { 0 => 0, 1 => 1, _ => 2 };
-        if sec != last && sec > 0 {
-            v.push((None, if sec == 1 { "Themen".to_string() } else { "Vorschläge".to_string() }, false, 0));
-        }
-        last = sec;
-        v.push((Some(i), e.label.clone(), a.cur == e.chan, e.unread));
-    }
-    v
-}
-
 fn draw_side(f: &mut Frame, a: &mut App, r: Rect) {
     let b = blk(" Kanäle ".into(), a.focus == Focus::Side && a.tab == View::Chat);
     let inner = b.inner(r);
     f.render_widget(b, r);
-    let rows = side_rows(a);
+    let rows = a.side_rows();
     let h = inner.height as usize;
-    let selr = rows.iter().position(|r| r.2).unwrap_or(0);
+    let selr = rows.iter().position(|x| match (x, a.hdr) { (Row::Head(s), Some(h)) => *s == h, (Row::Ent(i), None) => a.entries[*i].chan == a.cur, _ => false }).unwrap_or(0);
     let off = if selr >= h { selr + 1 - h } else { 0 };
     let mut lines = vec![];
-    for (k, (idx, label, sel, un)) in rows.into_iter().enumerate().skip(off).take(h) {
+    for (k, row) in rows.into_iter().enumerate().skip(off).take(h) {
         let y = inner.y + (k - off) as u16;
-        let Some(i) = idx else { lines.push(Line::from(sp(format!(" ── {label}"), DIM))); continue };
+        let w = inner.width as usize;
+        let i = match row {
+            Row::Head(sec) => {
+                let col = a.is_col(sec);
+                let un = if col { a.sec_unread(sec) } else { 0 };
+                let badge = if un > 0 { format!(" +{un}") } else { String::new() };
+                let on = a.hdr == Some(sec);
+                let st = if on { DIM.bg(Color::Rgb(50, 56, 70)) } else { DIM };
+                let lab = trunc(&format!("{} {}", if col { "▸" } else { "▾" }, crate::uistate::SECS[sec].1), w.saturating_sub(tw(&badge)));
+                let pad = w.saturating_sub(tw(&lab) + tw(&badge));
+                a.hits.push((Rect::new(inner.x, y, inner.width, 1), Hit::Head(sec)));
+                lines.push(Line::from(vec![sp(lab, st), sp(" ".repeat(pad), st), sp(badge, st.fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
+                continue;
+            }
+            Row::Ent(i) => i,
+        };
+        let e = &a.entries[i];
+        let (label, sel, un) = (e.label.clone(), a.cur == e.chan && a.hdr.is_none(), e.unread);
         a.hits.push((Rect::new(inner.x, y, inner.width, 1), Hit::Chan(i)));
         let badge = if un > 0 { format!(" {un}") } else { String::new() };
-        let lab = trunc(&label, (inner.width as usize).saturating_sub(3 + tw(&badge)));
+        let lab = trunc(&label, w.saturating_sub(3 + tw(&badge)));
         let mut st = Style::new();
         if un > 0 { st = st.add_modifier(Modifier::BOLD) }
         if sel { st = st.bg(Color::Rgb(50, 56, 70)) }
-        let pad = (inner.width as usize).saturating_sub(2 + tw(&lab) + tw(&badge));
+        let pad = w.saturating_sub(2 + tw(&lab) + tw(&badge));
         lines.push(Line::from(vec![sp(if sel { "▸ " } else { "  " }, st.fg(Color::Cyan)), sp(lab, st), sp(" ".repeat(pad), st),
             sp(badge, st.fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
     }
@@ -208,9 +211,9 @@ pub fn msg_lines(a: &App, wd: usize) -> (Vec<Line<'static>>, Vec<(String, usize,
 }
 
 fn draw_chat(f: &mut Frame, a: &mut App, area: Rect) {
-    let sw = (area.width / 3).clamp(24, 44);
+    let sw = if a.sidebar { (area.width / 3).clamp(24, 44) } else { 0 };
     let [side, main] = Layout::horizontal([Length(sw), Min(10)]).areas(area);
-    draw_side(f, a, side);
+    if a.sidebar { draw_side(f, a, side) }
     let b = blk(format!(" {} ", a.cur.name()), a.focus == Focus::Main);
     let inner = b.inner(main);
     f.render_widget(b, main);
@@ -425,9 +428,9 @@ fn draw_foot(f: &mut Frame, a: &App, r: Rect) {
         }
     }
     let h = match (a.tab, a.focus) {
-        (View::Chat, Focus::Input) => "Enter senden · Alt+Enter Zeile · Tab Fokus · Ctrl+N Thema · F1 Hilfe",
+        (View::Chat, Focus::Input) => "Enter senden · Alt+Enter Zeile · Tab Fokus · Ctrl+N Thema · Ctrl+B Liste · F1 Hilfe",
         (View::Chat, Focus::Main) => "↑↓ Nachricht · r antworten · e reagieren · x löschen · u Freigabe weg · m/M gelesen · i schreiben · ? Hilfe",
-        (View::Chat, Focus::Side) => "↑↓ Kanal · Enter öffnen · n neu · x schließen · o öffnen · F vergessen · m gelesen · ? Hilfe",
+        (View::Chat, Focus::Side) => "↑↓ Kanal · Enter öffnen/auf-zuklappen · z alle ein/aus · Ctrl+B Liste · n neu · x schließen · o öffnen · F vergessen · m gelesen · ? Hilfe",
         (View::Props, _) => "↑↓ wählen · a zustimmen · d ablehnen · n neu · w zurückziehen · t Diskussion · ? Hilfe",
         (View::Wiki, _) => "↑↓ Dokument/scrollen · Enter lesen · Tab Fokus · ? Hilfe",
     };
@@ -557,7 +560,7 @@ fn draw_help(f: &mut Frame) {
         h("Allgemein"),
         k("F1 / ?", "Hilfe"), k("F3 F4 F5 / 1 2 3", "Chat · Vorschläge · Wiki (Tabs auch klickbar)"),
         k("Tab / Shift+Tab", "Fokus: Kanäle → Nachrichten → Eingabe"), k("Ctrl+N / Ctrl+P", "neues Thema / neuer Vorschlag"),
-        k("Ctrl+R", "jetzt aktualisieren"), k("F6", "Rückfrage vor dem Senden an/aus"), k("F7", "Bilder im Chat an/aus (Enter/o = Vollbild)"),
+        k("Ctrl+B / F8", "Kanalliste aus-/einblenden"), k("z (Kanäle)", "alle Bereiche ein-/ausklappen; Enter/Space/Klick auf Kopf klappt einen"), k("Ctrl+R", "jetzt aktualisieren"), k("F6", "Rückfrage vor dem Senden an/aus"), k("F7", "Bilder im Chat an/aus (Enter/o = Vollbild)"),
         k("Ctrl+C / q", "beenden (q nur wenn du nicht tippst)"),
         h("Maus"),
         k("F2", "Maus an/aus. Bei an: Klicken/Scrollen; zum Markieren+Kopieren mit dem Terminal"),

@@ -15,8 +15,10 @@ use std::time::Instant;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View { Chat, Props, Wiki }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Row { Head(usize), Ent(usize) }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus { Side, Main, Input }
-pub enum Hit { Tab(View), Chan(usize), Msg(String), Prop(usize), Doc(usize), Input }
+pub enum Hit { Tab(View), Head(usize), Chan(usize), Msg(String), Prop(usize), Doc(usize), Input }
 #[derive(Clone, Debug)]
 pub enum Tag { Send, Vote(u64, bool), Withdraw(u64), Propose, Check, MarkRead, Detail(u64), Doc(String), Done(&'static str) }
 pub struct Req { pub tag: Tag, pub name: &'static str, pub args: Value }
@@ -37,6 +39,7 @@ impl PropForm {
 }
 
 pub struct App {
+    pub col: HashSet<String>, pub sidebar: bool, pub hdr: Option<usize>, pub ui_path: Option<std::path::PathBuf>,
     pub draft: Option<Box<PropForm>>,
     pub pop: Option<Pop>, pub pop_off: Option<usize>,
     pub snap: Snap, pub loaded: bool, pub err: Option<String>, pub fails: u32,
@@ -67,6 +70,7 @@ pub use molt_client::model::{sender_id, tag_body};
 impl App {
     pub fn new(off: i64) -> App {
         App {
+            col: HashSet::new(), sidebar: true, hdr: None, ui_path: None,
             draft: None, pop: None, pop_off: None, snap: Snap::default(), loaded: false, err: None, fails: 0, tab: View::Chat, focus: Focus::Input,
             entries: vec![], cur: Chan::Group, extra: vec![], sel: None, scroll: 0, reveal: false, last_total: 0,
             ed: Editor::default(), quote: None, confirm: true, mouse: true, mouse_dirty: false,
@@ -202,7 +206,7 @@ impl App {
         self.focus = if t == View::Chat { Focus::Input } else { Focus::Side };
     }
     fn cycle(&mut self, fwd: bool) {
-        let o: &[Focus] = if self.tab == View::Chat { &[Focus::Side, Focus::Main, Focus::Input] } else { &[Focus::Side, Focus::Main] };
+        let o: &[Focus] = if self.tab == View::Chat && !self.sidebar { &[Focus::Main, Focus::Input] } else if self.tab == View::Chat { &[Focus::Side, Focus::Main, Focus::Input] } else { &[Focus::Side, Focus::Main] };
         let i = o.iter().position(|f| *f == self.focus).unwrap_or(0);
         self.focus = o[if fwd { (i + 1) % o.len() } else { (i + o.len() - 1) % o.len() }];
     }
@@ -265,10 +269,46 @@ impl App {
         self.sel = Some(ids[n].clone());
         self.reveal = true;
     }
+    pub fn is_col(&self, sec: usize) -> bool { self.col.contains(crate::uistate::SECS[sec.min(3)].0) }
+    /// Visible sidebar rows: a header per section; collapsed sections keep only the selected and unread channels.
+    pub fn side_rows(&self) -> Vec<Row> {
+        let mut v = vec![];
+        let mut last = usize::MAX;
+        for (i, e) in self.entries.iter().enumerate() {
+            let sec = (e.section as usize).min(3);
+            if sec != last { v.push(Row::Head(sec)); last = sec }
+            if !self.is_col(sec) || e.chan == self.cur || e.unread > 0 { v.push(Row::Ent(i)) }
+        }
+        v
+    }
+    pub fn sec_unread(&self, sec: usize) -> u64 { self.entries.iter().filter(|e| (e.section as usize).min(3) == sec).map(|e| e.unread).sum() }
+    pub fn save_ui(&self) { if let Some(p) = &self.ui_path { let _ = crate::uistate::save(p, &self.col, self.sidebar); } }
+    pub fn load_ui(&mut self, p: std::path::PathBuf) { (self.col, self.sidebar) = crate::uistate::load(&p); self.ui_path = Some(p); }
+    pub fn toggle_sec(&mut self, sec: usize) {
+        let id = crate::uistate::SECS[sec.min(3)].0.to_string();
+        if !self.col.remove(&id) { self.col.insert(id); }
+        self.save_ui();
+    }
+    pub fn toggle_all(&mut self) {
+        let present: Vec<usize> = { let mut v: Vec<usize> = self.entries.iter().map(|e| (e.section as usize).min(3)).collect(); v.dedup(); v };
+        if present.iter().all(|s| self.is_col(*s)) { self.col.clear() } else { for s in present { self.col.insert(crate::uistate::SECS[s].0.to_string()); } }
+        self.save_ui();
+    }
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar = !self.sidebar;
+        if !self.sidebar && self.focus == Focus::Side && self.tab == View::Chat { self.focus = Focus::Input }
+        self.save_ui();
+        self.toast(if self.sidebar { "Kanalliste: an (Ctrl+B)" } else { "Kanalliste: aus (Ctrl+B = wieder an)" }, false);
+    }
     fn side_move(&mut self, d: i32) {
-        let i = self.entries.iter().position(|e| e.chan == self.cur).unwrap_or(0) as i32;
-        let n = (i + d).clamp(0, self.entries.len() as i32 - 1) as usize;
-        if let Some(e) = self.entries.get(n) { let c = e.chan.clone(); self.select_chan(c) }
+        let rows = self.side_rows();
+        if rows.is_empty() { return }
+        let cur = match self.hdr { Some(s) => rows.iter().position(|r| *r == Row::Head(s)), None => rows.iter().position(|r| matches!(r, Row::Ent(i) if self.entries[*i].chan == self.cur)) }.unwrap_or(0) as i32;
+        let n = (cur + d).clamp(0, rows.len() as i32 - 1) as usize;
+        match rows[n] {
+            Row::Head(s) => self.hdr = Some(s),
+            Row::Ent(i) => { self.hdr = None; let c = self.entries[i].chan.clone(); self.select_chan(c) }
+        }
     }
     pub fn open_discussion(&mut self, id: u64) {
         self.tab = View::Chat; self.focus = Focus::Input; self.select_chan(Chan::Patch(id));
@@ -445,6 +485,8 @@ impl App {
             Tab => { self.cycle(true); return }
             BackTab => { self.cycle(false); return }
             Char('n') if ctrl => { self.modal = Some(Modal::NewTopic(String::new())); return }
+            Char('b') if ctrl => { self.toggle_sidebar(); return }
+            F(8) => { self.toggle_sidebar(); return }
             Char('p') if ctrl => { self.modal = Some(Modal::Propose(Box::new(PropForm::new()))); return }
             Char('r') if ctrl => { self.poke(); self.toast("Aktualisiere…", false); return }
             _ => {}
@@ -603,7 +645,9 @@ impl App {
         match k.code {
             Up | Char('k') => self.side_move(-1),
             Down | Char('j') => self.side_move(1),
-            Enter | Right => self.focus = Focus::Input,
+            Enter | Char(' ') if self.hdr.is_some() => { let s = self.hdr.unwrap(); self.toggle_sec(s) }
+            Char('z') => self.toggle_all(),
+            Enter | Right => { self.hdr = None; self.focus = Focus::Input }
             Char('m') => self.mark_read(),
             Char('n') => self.modal = Some(Modal::NewTopic(String::new())),
             Char(c @ ('x' | 'o' | 'F')) => match self.cur_topic() {
@@ -665,12 +709,13 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
                 let right = matches!(m.kind, MouseEventKind::Down(MouseButton::Right));
                 let h = self.hits.iter().rev().find(|(r, _)| inside(*r)).map(|(r, h)| (*r, match h {
-                    Hit::Tab(t) => Hit::Tab(*t), Hit::Chan(i) => Hit::Chan(*i), Hit::Msg(s) => Hit::Msg(s.clone()),
+                    Hit::Tab(t) => Hit::Tab(*t), Hit::Head(i) => Hit::Head(*i), Hit::Chan(i) => Hit::Chan(*i), Hit::Msg(s) => Hit::Msg(s.clone()),
                     Hit::Prop(i) => Hit::Prop(*i), Hit::Doc(i) => Hit::Doc(*i), Hit::Input => Hit::Input,
                 }));
                 match h {
                     Some((_, Hit::Tab(t))) => self.set_tab(t),
-                    Some((_, Hit::Chan(i))) => { if let Some(e) = self.entries.get(i) { let c = e.chan.clone(); self.select_chan(c); self.focus = Focus::Input } }
+                    Some((_, Hit::Head(sec))) => { self.hdr = Some(sec); self.focus = Focus::Side; self.toggle_sec(sec) }
+                    Some((_, Hit::Chan(i))) => { self.hdr = None; if let Some(e) = self.entries.get(i) { let c = e.chan.clone(); self.select_chan(c); self.focus = Focus::Input } }
                     Some((_, Hit::Msg(id))) => {
                         self.sel = Some(id); self.focus = Focus::Main;
                         if right { if let Some((_, b)) = self.sel_msg_text() { self.copy(&b) } }
@@ -717,6 +762,79 @@ mod t {
         a.on_ev(Ev::Snap(Ok(crate::model::fixtures::snap())));
         (a, rx)
     }
+    fn ent(c: Chan, label: &str, unread: u64, section: u8) -> Entry { Entry { chan: c, label: label.into(), unread, count: 0, section } }
+    fn side_app() -> App {
+        let (mut a, _) = app();
+        a.entries = vec![ent(Chan::Group, "Allgemein", 0, 0), ent(Chan::Topic("A".into()), "A", 0, 1), ent(Chan::Topic("B".into()), "B", 3, 1), ent(Chan::Topic("C".into()), "C", 0, 1), ent(Chan::Patch(1), "P1", 0, 2)];
+        a
+    }
+    fn tmpdir(n: &str) -> std::path::PathBuf { let d = std::env::temp_dir().join(format!("molt-tui-ap8-{n}-{}", std::process::id())); let _ = std::fs::remove_dir_all(&d); d }
+
+    #[test]
+    fn collapse_keeps_selected_and_unread() {
+        let mut a = side_app();
+        a.cur = Chan::Topic("A".into());
+        assert_eq!(a.side_rows().len(), 8);
+        a.toggle_sec(1);
+        let r = a.side_rows();
+        let ents: Vec<usize> = r.iter().filter_map(|x| if let Row::Ent(i) = x { Some(*i) } else { None }).collect();
+        assert_eq!(ents, vec![0, 1, 2, 4]); // A (selected) + B (unread) stay, C hidden
+        assert_eq!(a.sec_unread(1), 3);
+        a.toggle_sec(1);
+        assert_eq!(a.side_rows().len(), 8);
+        a.toggle_all();
+        assert!(a.is_col(0) && a.is_col(1) && a.is_col(2));
+        a.toggle_all();
+        assert!(a.col.is_empty());
+    }
+
+    #[test]
+    fn header_keyboard_and_mouse_toggle() {
+        let mut a = side_app();
+        a.focus = Focus::Side;
+        a.on_key(key(KeyCode::Up)); // Allgemein entry -> its header
+        assert_eq!(a.hdr, Some(0));
+        a.on_key(key(KeyCode::Char(' ')));
+        assert!(a.is_col(0));
+        a.on_key(key(KeyCode::Enter));
+        assert!(!a.is_col(0));
+        a.hits = vec![(Rect::new(0, 3, 20, 1), Hit::Head(1))];
+        a.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 2, row: 3, modifiers: KeyModifiers::NONE });
+        assert!(a.is_col(1));
+    }
+
+    #[test]
+    fn sidebar_toggle_moves_focus() {
+        let mut a = side_app();
+        a.focus = Focus::Side;
+        a.on_key(ctrl('b'));
+        assert!(!a.sidebar && a.focus == Focus::Input);
+        a.cycle(true);
+        assert_ne!(a.focus, Focus::Side);
+        a.on_key(ctrl('b'));
+        assert!(a.sidebar);
+    }
+
+    #[test]
+    fn ui_state_round_trip_and_corrupt() {
+        let d = tmpdir("rt");
+        let p = d.join("sub/ui.json");
+        let mut a = side_app();
+        a.load_ui(p.clone()); // missing -> defaults
+        assert!(a.col.is_empty() && a.sidebar);
+        a.toggle_sec(2); a.toggle_sidebar();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        let mut b = side_app();
+        b.load_ui(p.clone());
+        assert!(b.is_col(2) && !b.sidebar);
+        std::fs::write(&p, "{not json").unwrap();
+        let mut c = side_app();
+        c.load_ui(p);
+        assert!(c.col.is_empty() && c.sidebar);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn react_delete_threads_confirm_flows() {
         let (mut a, rx) = app();
