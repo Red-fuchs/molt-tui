@@ -416,8 +416,10 @@ fn draw_propose(f: &mut Frame, p: &PropForm) {
         for l in pv.iter().take(12) { body.push(Line::from(trunc(l, 84))) }
         if pv.len() > 12 { body.push(Line::from(sp(format!("… (+{} Zeilen)", pv.len() - 12), DIM))) }
         body.push(Line::default());
+        for w in &p.warns { body.push(Line::from(sp(format!("WARNUNG {}: {}", w.code, trunc(&w.text, 70)), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)))) }
         body.push(Line::from("Vorschlag einreichen = signierte Aktion: echte Signatur, nicht rückgängig zu machen."));
-        body.push(Line::from(sp("J = verbindlich einreichen · Esc zurück zum Formular · N abbrechen", BOLD)));
+        let key = if p.warns.is_empty() { "J = verbindlich einreichen" } else { "A = Warnungen akzeptieren und einreichen" };
+        body.push(Line::from(sp(format!("{key} · Esc zurück zum Formular · N abbrechen"), BOLD)));
         " Vorschlag prüfen · ECHTE SIGNATUR "
     } else {
         let k = p.kind();

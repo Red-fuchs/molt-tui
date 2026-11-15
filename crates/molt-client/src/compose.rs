@@ -115,6 +115,67 @@ pub fn plan(kind: Kind, a: &str, b: &str) -> Result<Plan, String> {
     }
 }
 
+/// A moltd wiki_edit warning (`<code>: <what>`), e.g. foreign_rewrite, open_path, rename_link, name_collision, header, file_ref.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Warning { pub code: String, pub text: String }
+
+/// Preview step result: the plan as it will be sent (header-complete) plus moltd's dry-run warnings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Checked { pub plan: Plan, pub warnings: Vec<Warning> }
+
+fn header(doc: &str) -> Option<&str> {
+    let r = doc.strip_prefix("---\n")?;
+    let i = r.find("\n---\n").or_else(|| r.ends_with("\n---").then(|| r.len() - 4))?;
+    Some(&doc[..4 + i + 4])
+}
+
+/// `content` replaces a whole page: keep the existing page's front matter unless the new text brings its own.
+pub fn keep_header(existing: &str, body: &str) -> String {
+    if body.starts_with("---\n") { return body.to_string() }
+    match header(existing) { Some(h) => format!("{}\n\n{}", h.trim_end(), body.trim_start_matches('\n')), None => body.to_string() }
+}
+
+/// moltd answers `id` for some tools and `proposal_id` for others.
+pub fn result_id(v: &Value) -> Option<u64> { ["id", "proposal_id"].iter().find_map(|k| v.get(*k).and_then(Value::as_u64)) }
+
+/// Parse `warnings` of a dry run: strings `<code>: <what>` or objects {code,text}.
+pub fn parse_warnings(v: &Value) -> Vec<Warning> {
+    v.get("warnings").and_then(Value::as_array).into_iter().flatten().map(|w| match w {
+        Value::String(t) => { let (c, x) = t.split_once(':').unwrap_or((t, "")); Warning { code: c.trim().into(), text: clean(x.trim()) } }
+        o => Warning { code: o["code"].as_str().unwrap_or("?").into(), text: clean(o.get("text").or(o.get("what")).and_then(Value::as_str).unwrap_or("")) },
+    }).collect()
+}
+
+/// Preview step. Non-wiki plans pass through unchanged. A wiki `content` op gets the existing page's header (via wiki_get) and the
+/// whole call is sent with `dry_run:true`; nothing is proposed. Errors from moltd (refused edit) come back as Err.
+pub fn check(m: &crate::mcp::Mcp, plan: Plan) -> Result<Checked, String> {
+    if plan.tool != "wiki_edit" { return Ok(Checked { plan, warnings: vec![] }) }
+    let mut plan = plan;
+    if let Some(e) = plan.args["edits"][0].as_object().filter(|e| e["op"] == "content").cloned() {
+        let path = e["path"].as_str().unwrap_or("");
+        match m.call("wiki_get", json!({"path":path})) {
+            Ok(d) => {
+                let old = d.get("content").and_then(Value::as_str).or(d.as_str()).unwrap_or("");
+                let body = keep_header(old, e["content"].as_str().unwrap_or(""));
+                plan.args["edits"][0]["content"] = json!(body);
+            }
+            Err(er) if er.starts_with("HTTP") || er.starts_with("transport:") || er.contains("Antwort") || crate::mcp::is_unknown(&er) => return Err(er),
+            Err(_) => {} // unknown path: a new page, no header to keep
+        }
+    }
+    let mut a = plan.args.clone();
+    a["dry_run"] = json!(true);
+    let r = m.call("wiki_edit", a)?;
+    Ok(Checked { plan, warnings: parse_warnings(&r) })
+}
+
+/// Confirm step: the call to send, acknowledging exactly the accepted warning codes.
+pub fn confirm(c: &Checked, accepted: &[String]) -> Plan {
+    let mut p = c.plan.clone();
+    if !accepted.is_empty() { p.args["allow_warnings"] = json!(accepted) }
+    p
+}
+
 /// Topic names: trimmed, one line, at most 64 chars (moltd: case-sensitive).
 pub fn topic_name(s: &str) -> Result<String, String> {
     let n = one(s).trim().to_string();
@@ -145,6 +206,36 @@ mod t {
         for bad in ["/a.md", "../a.md", "a/../b.md", "a.txt", "a\\b.md", "a//b.md", "", "a\n.md"] { assert!(plan(Kind::WikiNew, bad, "x").is_err(), "{bad}") }
         assert!(plan(Kind::WikiNew, "a.md", "  \n").is_err());
         assert!(plan(Kind::WikiNew, "a.md", &"x".repeat(MAX_WIKI + 1)).is_err());
+    }
+    #[test]
+    fn header_kept() {
+        let old = "---\ntype: meta\ntitle: A\n---\n\n# A\nalt";
+        assert_eq!(keep_header(old, "neu"), "---\ntype: meta\ntitle: A\n---\n\nneu");
+        assert_eq!(keep_header(old, "---\ntitle: B\n---\nx"), "---\ntitle: B\n---\nx");
+        assert_eq!(keep_header("kein header", "neu"), "neu");
+        assert_eq!(result_id(&json!({"proposal_id":3})), Some(3));
+        assert_eq!(parse_warnings(&json!({"warnings":["foreign_rewrite: page by bob"]}))[0], Warning { code: "foreign_rewrite".into(), text: "page by bob".into() });
+    }
+    #[test]
+    fn check_confirm_against_mock() {
+        use crate::{mcp::Mcp, mock::{sim::Sim, start}};
+        let (h, _) = Sim::new("me").into_handler(None);
+        let mk = start("T", h);
+        let m = Mcp::with(mk.url.clone(), "T".into());
+        let c = check(&m, plan(Kind::WikiEdit, "home.md", "# Neu").unwrap()).unwrap();
+        assert!(c.plan.args["edits"][0]["content"].as_str().unwrap().starts_with("---\ntype: meta"));
+        assert_eq!(c.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(), ["foreign_rewrite"]);
+        assert!(mk.called("wiki_edit").iter().all(|a| a["dry_run"] == true), "preview must not propose");
+        // sending without acknowledgement is refused by the (mock) daemon
+        assert!(m.call("wiki_edit", confirm(&c, &[]).args).unwrap_err().contains("foreign_rewrite"));
+        let ok = confirm(&c, &["foreign_rewrite".to_string()]);
+        assert_eq!(ok.args["allow_warnings"], json!(["foreign_rewrite"]));
+        assert!(result_id(&m.call("wiki_edit", ok.args).unwrap()).is_some());
+        // new page: no get hit, no warnings
+        let c = check(&m, plan(Kind::WikiNew, "n/x.md", "---\ntitle: X\n---\nhi").unwrap()).unwrap();
+        assert!(c.warnings.is_empty());
+        // non-wiki passes through
+        assert!(check(&m, plan(Kind::Note, "T", "").unwrap()).unwrap().warnings.is_empty());
     }
     #[test]
     fn others() {

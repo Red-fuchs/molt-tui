@@ -79,7 +79,10 @@ fn main() {
         while nrx.try_recv().is_ok() {}
     });
     std::thread::spawn(move || for r in rrx {
-        let res = worker.call(r.name, r.args);
+        let res = if r.name == "@check" {
+            let plan = molt_client::compose::Plan { tool: "wiki_edit", args: r.args, preview: String::new() };
+            molt_client::compose::check(&worker, plan).map(|c| serde_json::json!({"args":c.plan.args,"warnings":c.warnings.iter().map(|w| serde_json::json!({"code":w.code,"text":w.text})).collect::<Vec<_>>()}))
+        } else { worker.call(r.name, r.args) };
         if tx.send(Ev::Reply(r.tag, res)).is_err() { break }
     });
 

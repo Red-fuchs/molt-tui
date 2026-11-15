@@ -7,6 +7,8 @@ pub struct Mcp {
     tok: String,
     ag: ureq::Agent,
     sid: Mutex<Option<String>>,
+    rt: Duration,
+    wt: Duration,
 }
 
 /// Parse a JSON-RPC reply that is either plain JSON or SSE-framed (`data:` lines).
@@ -45,8 +47,10 @@ pub fn tool_result(v: &Value) -> Result<Value, String> {
     Ok(serde_json::from_str(&txt).unwrap_or(Value::String(txt)))
 }
 
-fn emsg(e: ureq::Error) -> String {
+fn emsg(e: ureq::Error, write: bool) -> String {
     match e {
+        ureq::Error::Transport(t) if write && !matches!(t.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns) =>
+            format!("{UNKNOWN}: keine Antwort ({}). Die Aktion kann trotzdem angekommen sein; Liste prüfen, bevor du es erneut versuchst", t.message().map_or_else(|| t.kind().to_string(), str::to_string)),
         ureq::Error::Status(401, _) => "HTTP 401 (Token abgelehnt)".into(),
         ureq::Error::Status(c, _) => format!("HTTP {c}"),
         ureq::Error::Transport(t) => format!("transport: {}", t.message().map_or_else(|| t.kind().to_string(), str::to_string)),
@@ -61,15 +65,24 @@ impl std::fmt::Debug for Mcp {
 
 /// Tools that only read (or are idempotent): safe to repeat after an ambiguous failure.
 pub fn is_read_only(name: &str) -> bool {
-    name.starts_with("read_") || name.starts_with("list_") || matches!(name, "status" | "download_file" | "mark_channel_read" | "quests_view" | "wiki_get" | "wiki_list" | "wiki_search" | "wiki_links" | "wiki_neighbors" | "wiki_props" | "wiki_health" | "wiki_changes")
+    name.starts_with("read_") || name.starts_with("list_") || matches!(name, "status" | "download_file" | "mark_channel_read" | "quests_view" | "wiki_get" | "wiki_resolve" | "resolve_upload" | "wiki_list" | "wiki_search" | "wiki_links" | "wiki_neighbors" | "wiki_props" | "wiki_health" | "wiki_changes")
 }
 
-/// Retry with a fresh session? Always when the daemon says the session is gone (request was not processed);
-/// after any other failure (timeout, 5xx, unreadable reply) only for read-only tools: a write may already have happened.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(20);
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Marker in the error of a write whose outcome is unknown (sent, no answer): UIs must not show it as "rejected".
+pub const UNKNOWN: &str = "Status unbekannt";
+
+pub fn is_unknown(err: &str) -> bool { err.starts_with(UNKNOWN) }
+
+/// Retry with a fresh session? Writes only for the exact expired-session case (`HTTP 404`: the daemon did not process the request,
+/// re-init is safe); a tool error or HTTP 400 that merely mentions "session" never retries a write.
+/// Read-only tools also retry on 400/"session"/5xx/transport/unreadable replies.
 pub fn should_retry(name: &str, err: &str) -> bool {
-    let l = err.to_lowercase();
-    let expired = err.starts_with("HTTP 404") || err.starts_with("HTTP 400") || l.contains("session");
-    expired || (is_read_only(name) && (err.starts_with("HTTP") || err.starts_with("transport:") || err.contains("Antwort")))
+    if err.starts_with("HTTP 404") { return true }
+    if !is_read_only(name) { return false }
+    err.starts_with("HTTP") || err.starts_with("transport:") || err.contains("Antwort") || err.to_lowercase().contains("session")
 }
 
 impl Mcp {
@@ -89,27 +102,31 @@ impl Mcp {
     pub fn with(url: String, tok: String) -> Self {
         let ag = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(3))
-            .timeout(Duration::from_secs(20))
+            .timeout(READ_TIMEOUT)
             .build();
-        Mcp { url, tok, ag, sid: Mutex::new(None) }
+        Mcp { url, tok, ag, sid: Mutex::new(None), rt: READ_TIMEOUT, wt: WRITE_TIMEOUT }
     }
 
-    fn post(&self, body: &Value, sid: Option<&str>) -> Result<(Option<String>, String), String> {
+    /// Override the per-request timeouts (reads, writes).
+    pub fn timeouts(mut self, rt: Duration, wt: Duration) -> Self { self.rt = rt; self.wt = wt; self }
+
+    fn post(&self, body: &Value, sid: Option<&str>, write: bool) -> Result<(Option<String>, String), String> {
         let mut r = self.ag.post(&self.url)
+            .timeout(if write { self.wt } else { self.rt })
             .set("Authorization", &format!("Bearer {}", self.tok))
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream");
         if let Some(s) = sid { r = r.set("Mcp-Session-Id", s) }
-        let resp = r.send_string(&body.to_string()).map_err(emsg)?;
+        let resp = r.send_string(&body.to_string()).map_err(|e| emsg(e, write))?;
         let sid = resp.header("Mcp-Session-Id").map(str::to_string);
-        let txt = resp.into_string().map_err(|e| e.to_string())?;
+        let txt = resp.into_string().map_err(|e| if write { format!("{UNKNOWN}: Antwort abgebrochen ({e}). Liste prüfen, bevor du es erneut versuchst") } else { e.to_string() })?;
         Ok((sid, txt))
     }
 
     fn init(&self) -> Result<Option<String>, String> {
         let (sid, _) = self.post(&json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
-            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"molt-client","version":"1"}}}), None)?;
-        self.post(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), sid.as_deref())?;
+            "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"molt-client","version":"1"}}}), None, false)?;
+        self.post(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), sid.as_deref(), false)?;
         Ok(sid)
     }
 
@@ -121,7 +138,7 @@ impl Mcp {
         };
         let sid = (!sid.is_empty()).then_some(sid);
         let (_, txt) = self.post(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-            "params":{"name":name,"arguments":args}}), sid.as_deref())?;
+            "params":{"name":name,"arguments":args}}), sid.as_deref(), !is_read_only(name))?;
         let v = parse_sse(&txt).ok_or("Antwort nicht lesbar")?;
         tool_result(&v)
     }
@@ -157,12 +174,30 @@ mod t {
     #[test]
     fn retry_rules() {
         assert!(should_retry("chat_send", "HTTP 404"));
-        assert!(should_retry("chat_send", "Session expired"));
+        assert!(!should_retry("chat_send", "Session expired") && !should_retry("propose", "HTTP 400") && !should_retry("wiki_edit", "session not found"));
+        assert!(should_retry("read_state", "HTTP 400") && should_retry("wiki_get", "bad session"));
+        for w in ["propose", "wiki_edit", "approve", "decline", "withdraw", "chat_send", "share_file"] { assert!(should_retry(w, "HTTP 404"), "{w}") }
         assert!(!should_retry("chat_send", "HTTP 502"));
         assert!(!should_retry("share_file", "transport: timed out"));
         assert!(!should_retry("chat_send", "Antwort nicht lesbar"));
         assert!(should_retry("read_state", "HTTP 502") && should_retry("status", "transport: reset"));
         assert!(!should_retry("read_state", "Token falsch"));
+    }
+    #[test]
+    fn write_timeout_is_unknown_not_rejected() {
+        use std::io::Read;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || for c in l.incoming().flatten() { std::thread::spawn(move || { let mut c = c; let mut b = [0u8; 8192]; let _ = c.read(&mut b); std::thread::sleep(Duration::from_secs(3)); }); });
+        let m = Mcp::with(format!("http://127.0.0.1:{port}/mcp"), "T".into()).timeouts(Duration::from_millis(300), Duration::from_millis(300));
+        // init itself hangs (read timeout) -> plain transport error, nothing was sent yet
+        let e = m.call("propose", json!({})).unwrap_err();
+        assert!(!is_unknown(&e) && !should_retry("propose", &e), "{e}");
+        // an established session whose write call hangs: outcome unknown
+        *m.sid.lock().unwrap() = Some("S".into());
+        let e = m.call("propose", json!({})).unwrap_err();
+        assert!(is_unknown(&e) && e.contains("Liste prüfen") && !e.to_lowercase().contains("abgelehnt"), "{e}");
+        assert!(!should_retry("propose", &e));
     }
     #[test]
     fn debug_hides_token() {
@@ -209,7 +244,7 @@ mod t {
             }
             seen
         });
-        let m = Mcp { url: format!("http://127.0.0.1:{port}/mcp"), tok: "T0K".into(), ag: ureq::agent(), sid: Mutex::new(None) };
+        let m = Mcp { url: format!("http://127.0.0.1:{port}/mcp"), tok: "T0K".into(), ag: ureq::agent(), sid: Mutex::new(None), rt: READ_TIMEOUT, wt: WRITE_TIMEOUT };
         let r = m.call("chat_send", json!({"body":"hi","channel":{"kind":"topic","name":"x"}})).unwrap();
         assert_eq!(r["ok"], true);
         let seen = h.join().unwrap();

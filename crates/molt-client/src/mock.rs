@@ -73,7 +73,7 @@ pub mod sim {
 
     pub struct Sim {
         pub seat: String, pub members: Vec<String>, pub threshold: u64, pub msgs: Vec<Value>, pub props: Vec<Value>,
-        pub uploads: Vec<Value>, pub pages: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, n: u64, next_prop: u64,
+        pub uploads: Vec<Value>, pub pages: Vec<String>, pub contents: Vec<(String, String)>, pub foreign: Vec<String>, pub blobs: Vec<(String, Vec<u8>)>, n: u64, next_prop: u64,
     }
 
     fn hex_id(n: u64) -> String { format!("{n:032x}") }
@@ -83,7 +83,7 @@ pub mod sim {
         /// Seat `seat`, members bob + carol, threshold 2; proposal 4 (open, by bob) and 1 (applied) exist.
         pub fn new(seat: &str) -> Sim {
             let mut m = Sim { seat: seat.into(), members: vec!["bob".into(), "carol".into(), seat.into()], threshold: 2, msgs: vec![], props: vec![],
-                uploads: vec![], pages: vec!["home.md".into()], blobs: vec![], n: 100, next_prop: 5 };
+                uploads: vec![], pages: vec!["home.md".into()], contents: vec![("home.md".into(), "---\ntype: meta\ntitle: Start\n---\n\n# Start\n".into())], foreign: vec!["home.md".into()], blobs: vec![], n: 100, next_prop: 5 };
             m.props.push(json!({"id":1,"state":"applied","by":"bob","surface":"memory","payload":{"op":"add_note","title":"Alt"},"approvals":2,"threshold":2,
                 "votes":[{"member":"bob","vote":"approved"},{"member":"carol","vote":"approved"}],"approved_by_me":false,"declined_by_me":false}));
             m.props.push(json!({"id":4,"state":"proposed","by":"bob","surface":"memory","payload":{"op":"wiki_patch","summary":"+1","value":"diff --git a/neu.md b/neu.md\nnew file mode 100644\n--- /dev/null\n+++ b/neu.md\n@@ -0,0 +1 @@\n+Hallo\n"},
@@ -122,6 +122,30 @@ pub mod sim {
             self.uploads.push(json!({"id":id,"local":"none","available":true,"online":true}));
             self.blobs.push((id.clone(), bytes.to_vec()));
             id
+        }
+        /// `n` applied filler proposals (neutral notes) appended in id order.
+        pub fn add_filler(&mut self, n: usize) {
+            for _ in 0..n {
+                let id = self.next_prop;
+                self.next_prop += 1;
+                self.props.push(json!({"id":id,"state":"applied","by":"bob","surface":"memory","payload":{"op":"add_note","title":format!("F{id}")},"approvals":2,"threshold":2,
+                    "votes":[],"approved_by_me":false,"declined_by_me":false}));
+            }
+        }
+        /// Like moltd: `state` open (default) | decided | all, ids ascend, `limit` default 100 / max 500, `cursor` = continue after this id,
+        /// `total` counts the filter, `next_cursor` absent on the last page.
+        fn list(&self, a: &Value) -> Value {
+            let st = a.get("state").and_then(Value::as_str).unwrap_or("open");
+            let limit = a.get("limit").and_then(Value::as_u64).unwrap_or(100).clamp(1, 500) as usize;
+            let after = a.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+            let mut f: Vec<&Value> = self.props.iter().filter(|p| match st { "all" => true, "decided" => p["state"] != "proposed", _ => p["state"] == "proposed" }).collect();
+            f.sort_by_key(|p| p["id"].as_u64().unwrap_or(0));
+            let total = f.len();
+            let rest: Vec<&Value> = f.into_iter().filter(|p| p["id"].as_u64().unwrap_or(0) > after).collect();
+            let page: Vec<Value> = rest.iter().take(limit).map(|p| (*p).clone()).collect();
+            let mut r = json!({"proposals":page,"total":total});
+            if rest.len() > limit { r["next_cursor"] = page.last().map_or(json!(null), |p| p["id"].clone()) }
+            r
         }
         fn prop_mut(&mut self, id: u64) -> Result<&mut Value, String> {
             self.props.iter_mut().find(|p| p["id"] == id).ok_or_else(|| format!("unknown proposal {id}"))
@@ -180,7 +204,7 @@ pub mod sim {
                 })(),
                 "read_actions" => Ok(json!({"actions":self.props.iter().filter(|p| p["state"] == "proposed" && p["approved_by_me"] != true && p["declined_by_me"] != true)
                     .map(|p| json!({"kind":"vote","proposal":p["id"]})).collect::<Vec<_>>()})),
-                "list_proposals" => Ok(json!({"proposals":self.props})),
+                "list_proposals" => Ok(self.list(a)),
                 "read_proposal" => a["id"].as_u64().ok_or("id fehlt".to_string()).and_then(|i| self.prop_mut(i).map(|p| p.clone())),
                 "mark_channel_read" => Ok(json!({"ok":true})),
                 "read_state" => {
@@ -237,24 +261,40 @@ pub mod sim {
                     if !ok { return Some(Err(format!("invalid payload for {sf}/{op}"))) }
                     Ok(self.mint(sf, p.clone(), json!({})))
                 }
+                "wiki_get" => (|| {
+                    let p = s(a, "path");
+                    let c = &self.contents.iter().find(|(i, _)| i == p).ok_or(format!("unknown path {p}"))?.1;
+                    Ok(json!({"base":"00","content":c,"files":[]}))
+                })(),
                 "wiki_edit" => (|| {
                     let edits = a["edits"].as_array().filter(|e| !e.is_empty()).ok_or("edits fehlen".to_string())?;
                     let (mut add, mut lines) = (0, 0);
                     let mut patch = String::new();
                     let mut pages = self.pages.clone();
+                    let mut warns: Vec<(&str, String)> = vec![];
                     for e in edits {
                         let (op, path, content) = (s(e, "op"), s(e, "path"), s(e, "content"));
                         if path.is_empty() || path.starts_with('/') || path.contains("..") { return Err(format!("bad path {path}")) }
                         match op {
                             "create" => { if pages.iter().any(|p| p == path) { return Err(format!("create refused: {path} already exists")) } pages.push(path.into()); add += 1 }
-                            "content" => { if !pages.iter().any(|p| p == path) { pages.push(path.into()); add += 1 } }
+                            "content" => {
+                                if !pages.iter().any(|p| p == path) { pages.push(path.into()); add += 1 }
+                                else {
+                                    if !content.starts_with("---\n") { return Err(format!("header: {path} would lose its front matter")) }
+                                    if self.foreign.iter().any(|f| f == path) { warns.push(("foreign_rewrite", format!("content over {path}, last written by another seat"))) }
+                                }
+                            }
                             o => return Err(format!("unsupported op {o}")),
                         }
                         lines += content.lines().count();
                         patch += &format!("diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n{}", content.lines().map(|l| format!("+{l}\n")).collect::<String>());
                     }
                     let summary = format!("+{add} ~{lines}");
-                    if a["dry_run"] == true { return Ok(json!({"summary":summary,"warnings":[],"paths":edits.iter().map(|e| e["path"].clone()).collect::<Vec<_>>()})) }
+                    let wl: Vec<String> = warns.iter().map(|(c, t)| format!("{c}: {t}")).collect();
+                    if a["dry_run"] == true { return Ok(json!({"summary":summary,"warnings":wl,"paths":edits.iter().map(|e| e["path"].clone()).collect::<Vec<_>>()})) }
+                    let ok = match &a["allow_warnings"] { Value::Bool(b) => *b, Value::Array(l) => warns.iter().all(|(c, _)| l.iter().any(|x| x == c)), _ => false };
+                    if !ok && !warns.is_empty() { return Err(format!("refused: {}", wl.join("; "))) }
+                    for e in edits { if s(e, "op") != "delete" { let (pa, c) = (s(e, "path").to_string(), s(e, "content").to_string()); self.contents.retain(|(i, _)| *i != pa); self.contents.push((pa.clone(), c)); self.foreign.retain(|f| *f != pa) } }
                     self.pages = pages;
                     Ok(self.mint("memory", json!({"op":"wiki_patch","summary":summary,"value":patch}), json!({"paths":edits.iter().map(|e| e["path"].clone()).collect::<Vec<_>>()})))
                 })(),
@@ -291,6 +331,19 @@ mod sim_t {
         assert_eq!(c(&mut m, "wiki_edit", json!({"edits":[{"op":"create","path":"a.md","content":"x\ny"}],"dry_run":true})).unwrap()["summary"], "+1 ~2");
         let r = c(&mut m, "wiki_edit", json!({"edits":[{"op":"create","path":"a.md","content":"x"}]})).unwrap();
         assert_eq!(r["channel"]["kind"], "patch");
+    }
+
+    #[test]
+    fn list_pages_like_moltd() {
+        let mut m = Sim::new("me");
+        m.add_filler(250);
+        let l = |m: &mut Sim, a: serde_json::Value| m.call("list_proposals", &a).unwrap().unwrap();
+        let r = l(&mut m, json!({"state":"all"}));
+        assert_eq!((r["proposals"].as_array().unwrap().len(), r["total"].clone(), r["next_cursor"].clone()), (100, json!(252), json!(102)));
+        let r = l(&mut m, json!({"state":"all","limit":9999}));
+        assert_eq!(r["proposals"].as_array().unwrap().len(), 252.min(500));
+        assert!(r.get("next_cursor").is_none());
+        assert_eq!(l(&mut m, json!({}))["total"], 1);
     }
 
 }

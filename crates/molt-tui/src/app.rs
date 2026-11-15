@@ -17,15 +17,15 @@ pub enum View { Chat, Props, Wiki }
 pub enum Focus { Side, Main, Input }
 pub enum Hit { Tab(View), Chan(usize), Msg(String), Prop(usize), Doc(usize), Input }
 #[derive(Clone, Debug)]
-pub enum Tag { Send, Vote(u64, bool), Withdraw(u64), Propose, MarkRead, Detail(u64), Doc(String) }
+pub enum Tag { Send, Vote(u64, bool), Withdraw(u64), Propose, Check, MarkRead, Detail(u64), Doc(String) }
 pub struct Req { pub tag: Tag, pub name: &'static str, pub args: Value }
 pub enum Ev { Snap(Result<Snap, String>), Reply(Tag, Result<Value, String>) }
 pub enum Modal { Send, Vote(u64, bool), Withdraw(u64), NewTopic(String), Propose(Box<PropForm>) }
 
 /// Proposal editor: type picker (field 0), one-line field (1), multi-line field (2); `plan` set = preview stage awaiting J.
-pub struct PropForm { pub kind: usize, pub field: usize, pub a: String, pub b: Editor, pub err: String, pub plan: Option<Plan> }
+pub struct PropForm { pub kind: usize, pub field: usize, pub a: String, pub b: Editor, pub err: String, pub plan: Option<Plan>, pub warns: Vec<compose::Warning> }
 impl PropForm {
-    pub fn new() -> Self { PropForm { kind: 0, field: 0, a: String::new(), b: Editor::default(), err: String::new(), plan: None } }
+    pub fn new() -> Self { PropForm { kind: 0, field: 0, a: String::new(), b: Editor::default(), err: String::new(), plan: None, warns: vec![] } }
     pub fn kind(&self) -> Kind { compose::ALL[self.kind] }
     fn used(&self, f: usize) -> bool { let (a, b) = self.kind().fields(); match f { 0 => true, 1 => !a.is_empty(), _ => !b.is_empty() } }
     fn step(&mut self, d: i32) {
@@ -121,14 +121,25 @@ impl App {
                 (Tag::Vote(id, _), Err(e)) => self.toast(format!("Abstimmung #{id} fehlgeschlagen: {}", one(&e)), true),
                 (Tag::Withdraw(id), Ok(_)) => { self.details.remove(&id); self.toast(format!("Vorschlag #{id} zurückgezogen"), false); self.poke() }
                 (Tag::Withdraw(id), Err(e)) => self.toast(format!("Zurückziehen #{id} fehlgeschlagen: {}", one(&e)), true),
+                (Tag::Check, r) => if let Some(mut f) = self.draft.take() {
+                    match r {
+                        Ok(v) => match compose::plan(f.kind(), &f.a, &f.b.text()) {
+                            Ok(mut p) => { p.args = v["args"].clone(); f.warns = compose::parse_warnings(&v); f.plan = Some(p); f.err.clear() }
+                            Err(e) => f.err = e,
+                        },
+                        Err(e) => f.err = one(&e),
+                    }
+                    self.modal = Some(Modal::Propose(f));
+                },
                 (Tag::Propose, Ok(v)) => {
                     self.draft = None;
-                    let id = v.get("id").and_then(Value::as_u64).map(|i| format!(" (#{i})")).unwrap_or_default();
+                    let id = compose::result_id(&v).map(|i| format!(" (#{i})")).unwrap_or_default();
                     self.toast(format!("Vorschlag eingereicht{id}"), false); self.poke();
                 }
                 (Tag::Propose, Err(e)) => {
                     if let Some(mut f) = self.draft.take() { f.err = one(&e); self.modal = Some(Modal::Propose(f)) }
-                    self.toast(format!("Vorschlag abgelehnt: {}", one(&e)), true);
+                    let head = if molt_client::mcp::is_unknown(&e) { "Vorschlag" } else { "Vorschlag abgelehnt:" };
+                    self.toast(format!("{head} {}", one(&e)), true);
                 }
                 (Tag::MarkRead, Ok(_)) => { self.toast("Als gelesen markiert", false); self.poke() }
                 (Tag::MarkRead, Err(e)) => self.toast(format!("Fehler: {}", one(&e)), true),
@@ -276,10 +287,17 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if f.plan.is_some() {
             match k.code {
-                Char('j' | 'J' | 'y' | 'Y') => {
+                Char(c @ ('j' | 'J' | 'y' | 'Y' | 'a' | 'A')) => {
+                    let accept = matches!(c, 'a' | 'A');
+                    if f.warns.is_empty() == accept { // warnings present: only A (accept) submits; none: only J
+                        if !accept { self.toast("Warnungen vorhanden: A akzeptiert sie und reicht ein", true) }
+                        return true;
+                    }
                     let p = f.plan.take().unwrap();
-                    self.draft = Some(Box::new(PropForm { kind: f.kind, field: f.field, a: std::mem::take(&mut f.a), b: std::mem::take(&mut f.b), err: String::new(), plan: Some(p.clone()) }));
-                    self.req(Tag::Propose, p.tool, p.args);
+                    let codes: Vec<String> = f.warns.iter().map(|w| w.code.clone()).collect();
+                    let sent = compose::confirm(&compose::Checked { plan: p.clone(), warnings: f.warns.clone() }, &codes);
+                    self.draft = Some(Box::new(PropForm { kind: f.kind, field: f.field, a: std::mem::take(&mut f.a), b: std::mem::take(&mut f.b), err: String::new(), plan: Some(p), warns: f.warns.clone() }));
+                    self.req(Tag::Propose, sent.tool, sent.args);
                     return false;
                 }
                 Esc => f.plan = None,
@@ -292,7 +310,16 @@ impl App {
         let w = self.in_w.max(20);
         match (k.code, f.field) {
             (Esc, _) => return false,
-            (Char('s'), _) if ctrl => preview(f),
+            (Char('s'), _) if ctrl => {
+                preview(f);
+                if f.plan.as_ref().is_some_and(|p| p.tool == "wiki_edit") { // dry run first: header + moltd warnings
+                    let p = f.plan.take().unwrap();
+                    self.draft = Some(Box::new(PropForm { kind: f.kind, field: f.field, a: std::mem::take(&mut f.a), b: std::mem::take(&mut f.b), err: String::new(), plan: None, warns: vec![] }));
+                    self.toast("Prüfe Vorschlag (Probelauf, nichts wird gesendet) …", false);
+                    self.req(Tag::Check, "@check", p.args);
+                    return false;
+                }
+            }
             (Tab, _) => f.step(1),
             (BackTab, _) => f.step(-1),
             (Left | Up, 0) => { f.kind = (f.kind + compose::ALL.len() - 1) % compose::ALL.len(); f.err.clear() }
@@ -672,10 +699,23 @@ mod t {
         a.on_key(key(KeyCode::Enter));
         typ(&mut a, "x"); a.on_key(key(KeyCode::Enter)); typ(&mut a, "y");
         a.on_key(ctrl('s'));
-        a.on_key(key(KeyCode::Char('j')));
         let r = rx.try_recv().unwrap();
-        assert_eq!(r.name, "wiki_edit");
+        assert_eq!(r.name, "@check", "preview is a dry run");
         assert_eq!(r.args["edits"][0], json!({"op":"create","path":"n/a.md","content":"x\ny"}));
+        // moltd warns: J must not submit, A accepts exactly these codes
+        a.on_ev(Ev::Reply(Tag::Check, Ok(json!({"args":r.args,"warnings":[{"code":"foreign_rewrite","text":"von bob"}]}))));
+        let Some(Modal::Propose(f)) = &a.modal else { panic!("form not restored") };
+        assert!(f.plan.is_some() && f.warns.len() == 1);
+        a.on_key(key(KeyCode::Char('j')));
+        assert!(rx.try_recv().is_err() && a.modal.is_some(), "J must not bypass warnings");
+        a.on_key(key(KeyCode::Char('a')));
+        let r = rx.try_recv().unwrap();
+        assert_eq!((r.name, r.args["allow_warnings"].clone()), ("wiki_edit", json!(["foreign_rewrite"])));
+        assert!(r.args.get("dry_run").is_none());
+        // no warnings: J submits plainly, A does nothing
+        a.on_ev(Ev::Reply(Tag::Propose, Err("x".into())));
+        a.on_ev(Ev::Reply(Tag::Propose, Ok(json!({"proposal_id":8}))));
+        assert!(a.toast.as_ref().unwrap().0.contains("#8") || a.toast.is_some());
     }
     #[test]
     fn esc_in_preview_goes_back_and_n_cancels() {

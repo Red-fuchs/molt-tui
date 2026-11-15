@@ -191,10 +191,28 @@ pub fn parse_snap(st: &Value, chat: &Value, props: &Value, acts: &Value, wiki: &
     }
 }
 
+/// All proposals (state "all"), paged with limit 500 via `next_cursor` (moltd's default page is only 100).
+/// Returns `{"proposals":[...],"total":n}`; a cursor that does not advance ends the loop instead of spinning.
+pub fn fetch_proposals(m: &Mcp) -> Result<Value, String> {
+    let (mut all, mut cur, mut total) = (vec![], None::<Value>, None);
+    for _ in 0..1000 {
+        let mut a = json!({"state":"all","limit":500});
+        if let Some(c) = &cur { a["cursor"] = c.clone() }
+        let r = m.call("list_proposals", a)?;
+        all.extend(r.get("proposals").and_then(Value::as_array).cloned().unwrap_or_default());
+        total = r.get("total").cloned().or(total);
+        match r.get("next_cursor").filter(|c| !c.is_null()) {
+            Some(n) if Some(n) != cur.as_ref() => cur = Some(n.clone()),
+            _ => break,
+        }
+    }
+    Ok(json!({"proposals":all,"total":total.unwrap_or(Value::Null)}))
+}
+
 pub fn fetch_snap(m: &Mcp) -> Result<Snap, String> {
     let st = m.call("status", json!({}))?;
     let chat = m.call("read_state", json!({"surface":"chat"}))?;
-    let props = m.call("list_proposals", json!({"state":"all"}))?;
+    let props = fetch_proposals(m)?;
     let acts = m.call("read_actions", json!({}))?;
     let wiki = m.call("wiki_list", json!({"limit":500}))?;
     Ok(parse_snap(&st, &chat, &props, &acts, &wiki))
@@ -313,5 +331,29 @@ mod t {
         assert_eq!(Chan::Patch(4).to_json().unwrap()["id"], 4);
         assert!(Chan::Group.to_json().is_none());
         assert_eq!(Chan::from_json(&json!({"kind":"topic","name":"x"})), Chan::Topic("x".into()));
+    }
+
+    #[test]
+    fn fetch_proposals_pages_and_shows_newest() {
+        use crate::mock::{sim::Sim, start};
+        let mut sim = Sim::new("me");
+        sim.add_filler(700);
+        let (h, _) = sim.into_handler(None);
+        let mk = start("T", h);
+        let m = Mcp::with(mk.url.clone(), "T".into());
+        let r = fetch_proposals(&m).unwrap();
+        let ids: Vec<u64> = r["proposals"].as_array().unwrap().iter().map(|p| p["id"].as_u64().unwrap()).collect();
+        assert_eq!((ids.len(), r["total"].clone()), (702, json!(702)));
+        assert_eq!(ids.last(), Some(&704)); // newest present (a single default page of 100 would stop at 104)
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(mk.called("list_proposals").len(), 2);
+        assert!(mk.called("list_proposals").iter().all(|a| a["limit"] == 500 && a["state"] == "all"));
+    }
+    #[test]
+    fn fetch_proposals_stuck_cursor_terminates() {
+        use crate::mock::start;
+        let mk = start("T", std::sync::Arc::new(|_, _| Ok(json!({"proposals":[{"id":1}],"total":1,"next_cursor":7}))));
+        let r = fetch_proposals(&Mcp::with(mk.url.clone(), "T".into())).unwrap();
+        assert!(mk.called("list_proposals").len() <= 2 && r["proposals"].as_array().unwrap().len() <= 2);
     }
 }
