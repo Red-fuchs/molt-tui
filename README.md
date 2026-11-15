@@ -48,6 +48,7 @@ Looking for a browser UI? See [molt-web](https://github.com/Red-fuchs/molt-web),
 Shared images (png, jpeg, gif, webp) render inline in the chat as **pixel art**: up to 56 cells wide and 10 rows, 2 pixels per cell via `▀` (nearest-neighbour resize, colours snapped to the xterm 6x6x6 palette). Works in any terminal incl. tmux; no terminal queries.
 
 - `MOLT_IMAGES=graphics` opts in to real graphics (kitty, iTerm2, sixel; halfblocks fallback), detected by querying the terminal. Inside tmux enable `set -g allow-passthrough on`.
+- Pixel mode uses smooth (Catmull-Rom) scaling, up to 100 columns x 22 rows, and 24-bit colour when `COLORTERM` is `truecolor`/`24bit` (otherwise the 256-colour cube). Force with `MOLT_IMAGES_COLORS=true` or `256`. Inside tmux truecolor needs `set -ga terminal-overrides ",*:Tc"`.
 - `MOLT_IMAGES=off` disables images (captions only). `F7` toggles at runtime.
 - Only files that passed the size and sha256 check are shown; until then the caption says "wird geprüft". Files over 15 MB are not fetched. GIFs show the first frame with a `GIF` badge.
 - `Enter` or `o` on a loaded image message opens a full-screen viewer (`←`/`→` browse, `Esc` closes). On other messages `Enter` still replies.

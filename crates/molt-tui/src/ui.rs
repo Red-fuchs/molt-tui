@@ -190,7 +190,7 @@ pub fn msg_lines(a: &App, wd: usize) -> (Vec<Line<'static>>, Vec<(String, usize,
                 let st = if a.imgs.on { a.imgs.state(&m.id) } else { ImgState::Off };
                 lines.push(Line::from(vec![bar(" "), sp(format!("  {}", imglay::caption(&name, f.size, gif, &st)), DIM)]).style(bg));
                 if let (true, Some(Slot::Ready { w, h, .. })) = (a.imgs.on, slot) {
-                    let (c, r) = imglay::fit_cells(*w, *h, a.imgs.font().0, a.imgs.font().1, wd.saturating_sub(4).min(if a.imgs.px { 56 } else { u16::MAX as usize }) as u16, 10);
+                    let (c, r) = imglay::fit_cells(*w, *h, a.imgs.font().0, a.imgs.font().1, wd.saturating_sub(4).min(if a.imgs.px { 100 } else { u16::MAX as usize }) as u16, if a.imgs.px { 22 } else { 10 });
                     if r > 0 {
                         let s = lines.len();
                         for _ in 0..r { lines.push(Line::from(bar(" ")).style(bg)) }
@@ -601,6 +601,7 @@ pub fn dump(a: &mut App, wd: u16, ht: u16) -> String {
             let s = c.symbol();
             match (s, c.fg, c.bg) {
                 ("▀", Color::Indexed(t), Color::Indexed(b)) => line.push(crate::pixel::half(t, b)),
+                ("▀", Color::Rgb(a, b, c2), Color::Rgb(d, e, g)) => line.push(crate::pixel::half_rgb([a, b, c2], [d, e, g])),
                 _ => line.push_str(s),
             }
             x += (s.width() as u16).max(1);
